@@ -1,0 +1,700 @@
+name: Feature Preprocessing v2.0 - Unsupervised
+inputs:
+  - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
+  - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
+  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer", optional: true, default: "5000"}
+  - {name: rare_threshold, type: Float, description: "Rare label threshold for categorical", optional: true, default: "0.01"}
+  - {name: enable_string_similarity, type: String, description: "true/false for high-cardinality grouping", optional: true, default: "false"}
+  - {name: create_interactions, type: String, description: "true/false to create polynomial interactions", optional: true, default: "false"}
+  - {name: interaction_degree, type: Integer, description: "Polynomial degree for interactions", optional: true, default: "2"}
+  - {name: max_interaction_features, type: Integer, description: "Max interaction features to create", optional: true, default: "15"}
+  - {name: add_row_statistics, type: String, description: "true/false to add per-row statistical features", optional: true, default: "true"}
+  - {name: scaling_strategy, type: String, description: "robust | standard | minmax | auto", optional: true, default: "robust"}
+outputs:
+  - {name: preprocessed_data, type: Dataset, description: "Preprocessed features ready for anomaly detection"}
+  - {name: preprocessor, type: Data, description: "Fitted Preprocessor cloudpickle"}
+  - {name: preprocessing_metadata, type: Data, description: "JSON metadata with preprocessing details"}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, traceback, gzip, warnings
+        from datetime import datetime
+        from itertools import combinations
+        import pandas as pd, numpy as np
+        from sklearn.impute import SimpleImputer, KNNImputer
+        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, LabelEncoder
+        from sklearn.pipeline import Pipeline
+        from sklearn.experimental import enable_iterative_imputer
+        from sklearn.impute import IterativeImputer
+        from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+        from scipy import stats
+        import cloudpickle
+        
+        warnings.filterwarnings('ignore')
+        
+        # Helper functions
+        def ensure_dir_for(p):
+            d=os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        def collapse_rare_labels(series, threshold_frac=0.01):
+            counts=series.value_counts(dropna=False)
+            n=len(series)
+            rare = set(counts[counts <= max(1,int(threshold_frac*n))].index)
+            return series.map(lambda x: "__RARE__" if x in rare else x), rare
+
+        def string_similarity_group(series, score_threshold=90):
+            vals=[v for v in pd.Series(series.dropna().unique()).astype(str)]
+            mapping={}; used=set()
+            for v in vals:
+                if v in used: continue
+                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
+                group=[m[0] for m in matches]
+                for g in group: mapping[g]=v; used.add(g)
+            return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
+
+        def frequency_encoding(series):
+            freq_map = series.value_counts(normalize=True).to_dict()
+            return series.map(lambda x: freq_map.get(x, 0.0)), freq_map
+
+        def choose_scaler(strategy='auto', sample_series=None):
+            if strategy == 'robust':
+                return RobustScaler()
+            elif strategy == 'standard':
+                return StandardScaler()
+            elif strategy == 'minmax':
+                return MinMaxScaler()
+            elif strategy == 'auto' and sample_series is not None:
+                v = sample_series.dropna()
+                if v.empty or v.std(ddof=0) == 0:
+                    return StandardScaler()
+                
+                skew = abs(float(v.skew()))
+                kurt = abs(float(v.kurtosis())) if len(v) > 3 else 0.0
+                extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
+                
+                # For anomaly detection, prefer robust scaling
+                if extreme_frac > 0.01 or kurt > 10:
+                    return RobustScaler()
+                elif skew >= 1.0:
+                    return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', StandardScaler())])
+                else:
+                    return StandardScaler()
+            else:
+                return RobustScaler()  # Default for anomaly detection
+
+        def choose_categorical_encoder(col, series, n_rows):
+            nunique = series.nunique(dropna=True)
+            
+            if nunique == 0:
+                return 'drop', None
+            elif nunique == 1:
+                return 'drop', None
+            elif nunique == 2:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            elif nunique <= 10:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            elif nunique <= 50:
+                return 'frequency', None
+            else:
+                # High cardinality - use frequency encoding
+                return 'frequency', None
+
+        def add_polynomial_features(df, numeric_cols, degree=2, interaction_only=True, max_features=20):
+            if len(numeric_cols) < 2:
+                print("[INFO] Not enough numeric columns for interactions (need ≥2)")
+                return df, []
+            
+            print(f"[INFO] Creating polynomial features (degree={degree}, max={max_features})")
+            
+            # Select top columns by variance
+            variances = df[numeric_cols].var().sort_values(ascending=False)
+            top_cols = variances.head(min(5, len(numeric_cols))).index.tolist()
+            
+            new_features = {}
+            new_feature_names = []
+            interaction_count = 0
+            
+            # Create interactions
+            for col1, col2 in combinations(top_cols, 2):
+                if interaction_count >= max_features:
+                    break
+                
+                # Multiplication
+                interaction_name = f"{col1}_x_{col2}"
+                new_features[interaction_name] = df[col1] * df[col2]
+                new_feature_names.append(interaction_name)
+                interaction_count += 1
+                
+                # Division (if denominator never zero)
+                if (df[col2] != 0).all():
+                    div_name = f"{col1}_div_{col2}"
+                    new_features[div_name] = df[col1] / (df[col2] + 1e-10)
+                    new_feature_names.append(div_name)
+                    interaction_count += 1
+                    
+                if interaction_count >= max_features:
+                    break
+            
+            # Add squared terms
+            if degree >= 2 and interaction_count < max_features:
+                for col in top_cols[:3]:
+                    if interaction_count >= max_features:
+                        break
+                    sq_name = f"{col}_squared"
+                    new_features[sq_name] = df[col] ** 2
+                    new_feature_names.append(sq_name)
+                    interaction_count += 1
+            
+            # Add to dataframe
+            for name, values in new_features.items():
+                df[name] = values
+            
+            print(f"[INFO] Created {len(new_features)} polynomial/interaction features")
+            return df, new_feature_names
+
+        def add_row_statistics(df, numeric_cols):
+            print("[INFO] Adding row-level statistical features...")
+            
+            if not numeric_cols:
+                print("[WARNING] No numeric columns for row statistics")
+                return df, []
+            
+            num_data = df[numeric_cols].values
+            new_features = {}
+            feature_names = []
+            
+            # Row statistics
+            new_features['row_mean'] = np.nanmean(num_data, axis=1)
+            new_features['row_std'] = np.nanstd(num_data, axis=1)
+            new_features['row_median'] = np.nanmedian(num_data, axis=1)
+            new_features['row_min'] = np.nanmin(num_data, axis=1)
+            new_features['row_max'] = np.nanmax(num_data, axis=1)
+            new_features['row_range'] = new_features['row_max'] - new_features['row_min']
+            new_features['row_skew'] = stats.skew(num_data, axis=1, nan_policy='omit')
+            new_features['row_kurtosis'] = stats.kurtosis(num_data, axis=1, nan_policy='omit')
+            
+            # Missing value pattern (important for anomaly detection)
+            new_features['row_null_count'] = np.isnan(num_data).sum(axis=1)
+            new_features['row_null_fraction'] = new_features['row_null_count'] / len(numeric_cols)
+            
+            feature_names = list(new_features.keys())
+            
+            for name, values in new_features.items():
+                df[name] = values
+            
+            print(f"[INFO] Added {len(new_features)} row-level features")
+            return df, feature_names
+
+        # Preprocessor Class for Unsupervised Learning
+        class UnsupervisedPreprocessor:
+            def __init__(self):
+                self.num_cols = []
+                self.cat_cols = []
+                self.col_config = {}
+                self.global_metadata = {}
+                self.original_input_columns = []
+                self.interaction_features = []
+                self.row_stat_features = []
+
+            def fit(self, df, config=None):
+                self.global_metadata['config'] = config or {}
+                nrows = len(df)
+                self.original_input_columns = list(df.columns)
+                
+                # Identify numeric and categorical columns
+                self.num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                self.cat_cols = [c for c in df.columns if c not in self.num_cols]
+                
+                print(f"[INFO] Identified {len(self.num_cols)} numeric and {len(self.cat_cols)} categorical columns")
+                
+                # Configure numeric columns
+                for c in self.num_cols:
+                    s = df[c]
+                    cfg = {}
+                    
+                    missing_frac = s.isna().mean()
+                    cfg['missing_frac'] = float(missing_frac)
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['mean'] = float(s.mean()) if not s.isna().all() else 0.0
+                    cfg['std'] = float(s.std()) if not s.isna().all() else 0.0
+                    cfg['skew'] = float(s.dropna().skew()) if len(s.dropna()) > 2 else 0.0
+                    cfg['kurtosis'] = float(s.dropna().kurtosis()) if len(s.dropna()) > 3 else 0.0
+                    
+                    # Choose imputation strategy
+                    if missing_frac == 0:
+                        cfg['imputer'] = ('none', None)
+                    elif missing_frac < 0.02:
+                        imp = SimpleImputer(strategy='median')
+                        imp.fit(np.array(s).reshape(-1, 1))
+                        cfg['imputer'] = ('simple_median', imp)
+                    elif missing_frac < 0.25 and nrows <= config.get('max_knn_rows', 5000):
+                        cfg['imputer'] = ('knn', {'n_neighbors': 5})
+                    else:
+                        cfg['imputer'] = ('iterative', {'max_iter': 10, 'random_state': 42})
+                    
+                    cfg['scaler_choice'] = config.get('scaling_strategy', 'robust')
+                    self.col_config[c] = cfg
+                
+                # Configure categorical columns
+                for c in self.cat_cols:
+                    s = df[c].astype(object)
+                    cfg = {}
+                    
+                    cfg['n_unique'] = int(s.nunique(dropna=True))
+                    cfg['missing_frac'] = float(s.isna().mean())
+                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
+                    cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.01)
+                    
+                    # Choose encoding strategy
+                    enc_name, enc_obj = choose_categorical_encoder(c, s, nrows)
+                    cfg['encoder_type'] = enc_name
+                    cfg['encoder_obj'] = enc_obj
+                    
+                    self.col_config[c] = cfg
+                
+                # Fit categorical encoders
+                for c in self.cat_cols:
+                    cfg = self.col_config[c]
+                    enc_type = cfg['encoder_type']
+                    
+                    if enc_type == 'onehot' and cfg['encoder_obj'] is not None:
+                        ohe = cfg['encoder_obj']
+                        resh = df[[c]].astype(str).fillna('__MISSING__')
+                        ohe.fit(resh)
+                        cfg['encoder_obj'] = ohe
+                        cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        print(f"[INFO] OneHot fitted for '{c}': {len(ohe.categories_[0])} categories")
+                    
+                    elif enc_type == 'frequency':
+                        freq_map = df[c].astype(object).value_counts(normalize=True).to_dict()
+                        cfg['frequency_map'] = freq_map
+                        print(f"[INFO] Frequency encoder fitted for '{c}': {len(freq_map)} categories")
+                    
+                    elif enc_type == 'drop':
+                        print(f"[INFO] Column '{c}' marked for dropping (constant or empty)")
+                
+                self.global_metadata['num_cols'] = self.num_cols
+                self.global_metadata['cat_cols'] = self.cat_cols
+                
+                return self
+
+            def transform(self, df, training_mode=False):
+                df = df.copy()
+                
+                print("[INFO] Starting transformation...")
+                
+                # Clean inf/nan strings
+                df.replace(["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf"], 
+                          np.nan, inplace=True)
+                
+                for c in self.num_cols:
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors='coerce')
+                
+                # NUMERIC IMPUTATION
+                print("[INFO] Imputing missing values...")
+                
+                # Prepare temporary df with median-filled values for KNN/Iterative
+                temp_df = df.copy()
+                for c in self.num_cols:
+                    if c not in temp_df.columns:
+                        continue
+                    imputer_info = self.col_config.get(c, {}).get('imputer', ('none', None))
+                    if imputer_info[0] in ('knn', 'iterative'):
+                        med = pd.to_numeric(temp_df[c], errors='coerce').median()
+                        temp_df[c] = temp_df[c].fillna(med if not np.isnan(med) else 0)
+                
+                # KNN imputation
+                need_knn = [c for c in self.num_cols if c in df.columns and 
+                           self.col_config.get(c, {}).get('imputer', ('none', None))[0] == 'knn']
+                
+                if need_knn:
+                    print(f"[INFO] KNN imputation on {len(need_knn)} columns...")
+                    try:
+                        knn = KNNImputer(n_neighbors=5)
+                        imputed = knn.fit_transform(temp_df[need_knn])
+                        df[need_knn] = pd.DataFrame(imputed, columns=need_knn, index=df.index)
+                    except Exception as e:
+                        print(f"[WARNING] KNN imputation failed: {e}, falling back to median")
+                        for c in need_knn:
+                            df[c] = df[c].fillna(df[c].median())
+                
+                # Iterative imputation
+                need_iter = [c for c in self.num_cols if c in df.columns and 
+                            self.col_config.get(c, {}).get('imputer', ('none', None))[0] == 'iterative']
+                
+                if need_iter:
+                    print(f"[INFO] Iterative imputation on {len(need_iter)} columns...")
+                    try:
+                        iter_imp = IterativeImputer(max_iter=10, random_state=42)
+                        arr = df[need_iter].astype(float).replace([np.inf, -np.inf], np.nan).values
+                        iter_out = iter_imp.fit_transform(arr)
+                        df[need_iter] = pd.DataFrame(iter_out, columns=need_iter, index=df.index)
+                    except Exception as e:
+                        print(f"[WARNING] Iterative imputation failed: {e}, falling back to median")
+                        for c in need_iter:
+                            df[c] = df[c].fillna(df[c].median())
+                
+                # Simple median imputation
+                for c in self.num_cols:
+                    if c not in df.columns:
+                        continue
+                    cfg = self.col_config.get(c, {})
+                    if cfg.get('imputer', ('none', None))[0] == 'simple_median':
+                        imp = cfg['imputer'][1]
+                        try:
+                            df[c] = imp.transform(df[[c]])
+                        except Exception:
+                            df[c] = df[c].fillna(df[c].median())
+                
+                # Fill any remaining nulls in numeric columns
+                for c in self.num_cols:
+                    if c in df.columns and df[c].isna().any():
+                        df[c] = df[c].fillna(df[c].median())
+                
+                # NUMERIC SCALING
+                print("[INFO] Scaling numeric features...")
+                cfg_global = self.global_metadata.get('config', {})
+                scaling_strategy = cfg_global.get('scaling_strategy', 'robust')
+                
+                for c in self.num_cols:
+                    if c not in df.columns:
+                        continue
+                    
+                    # Get or create scaler
+                    if 'scaler_obj' not in self.col_config[c]:
+                        scaler = choose_scaler(scaling_strategy, df[c])
+                        try:
+                            scaler.fit(df[[c]].fillna(0).values)
+                            self.col_config[c]['scaler_obj'] = scaler
+                        except Exception:
+                            scaler = RobustScaler()
+                            scaler.fit(df[[c]].fillna(0).values)
+                            self.col_config[c]['scaler_obj'] = scaler
+                    
+                    scaler = self.col_config[c]['scaler_obj']
+                    
+                    try:
+                        transformed = scaler.transform(df[[c]].fillna(0).values)
+                        df[c] = transformed.reshape(-1)
+                    except Exception as e:
+                        print(f"[WARNING] Scaling failed for '{c}': {e}")
+                        df[c] = StandardScaler().fit_transform(df[[c]].fillna(0).values).reshape(-1)
+                
+                # ROW STATISTICS (training only)
+                if training_mode and cfg_global.get('add_row_statistics', True):
+                    current_num_cols = [c for c in df.columns if c in self.num_cols]
+                    df, row_stat_cols = add_row_statistics(df, current_num_cols)
+                    self.row_stat_features = row_stat_cols
+                
+                # POLYNOMIAL INTERACTIONS (training only)
+                if training_mode and cfg_global.get('create_interactions', False):
+                    print("[INFO] Creating polynomial/interaction features...")
+                    current_num_cols = [c for c in df.columns if c in self.num_cols]
+                    if len(current_num_cols) >= 2:
+                        df, interaction_cols = add_polynomial_features(
+                            df, 
+                            current_num_cols, 
+                            degree=cfg_global.get('interaction_degree', 2), 
+                            interaction_only=True, 
+                            max_features=cfg_global.get('max_interaction_features', 15)
+                        )
+                        self.interaction_features = interaction_cols
+                
+                # CATEGORICAL ENCODING
+                print("[INFO] Encoding categorical features...")
+                cols_to_drop = []
+                
+                for c in [cc for cc in self.cat_cols if cc in df.columns]:
+                    cfg = self.col_config.get(c, {})
+                    enc_type = cfg.get('encoder_type')
+                    
+                    if enc_type == 'drop':
+                        cols_to_drop.append(c)
+                        continue
+                    
+                    s = df[c].astype(object).fillna('__MISSING__')
+                    
+                    # Collapse rare labels
+                    rare_thresh = cfg.get('rare_threshold_frac', 0.01)
+                    collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh)
+                    df[c] = collapsed
+                    
+                    if training_mode:
+                        cfg['rare_values'] = list(rare_set)
+                    
+                    # String similarity grouping (high cardinality)
+                    if cfg_global.get('enable_string_similarity', False) and cfg.get('n_unique', 0) > 20:
+                        grouped, mapping = string_similarity_group(df[c], score_threshold=90)
+                        df[c] = grouped
+                        if training_mode:
+                            cfg['string_similarity_map'] = mapping
+                    
+                    # Apply encoding
+                    if enc_type == 'onehot':
+                        ohe = cfg.get('encoder_obj')
+                        if ohe is None:
+                            ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                            resh = df[[c]].astype(str).fillna('__MISSING__')
+                            ohe.fit(resh)
+                            cfg['encoder_obj'] = ohe
+                            cfg['ohe_columns'] = [f"{c}__{cat}" for cat in ohe.categories_[0]]
+                        
+                        ohe_columns = cfg.get('ohe_columns', [])
+                        arr = ohe.transform(df[[c]].astype(str).fillna('__MISSING__'))
+                        df_ohe = pd.DataFrame(arr, columns=ohe_columns, index=df.index)
+                        df = pd.concat([df.drop(columns=[c]), df_ohe], axis=1)
+                    
+                    elif enc_type == 'frequency':
+                        freq_map = cfg.get('frequency_map', {})
+                        if not freq_map and training_mode:
+                            _, freq_map = frequency_encoding(df[c])
+                            cfg['frequency_map'] = freq_map
+                        df[c] = df[c].map(lambda x: freq_map.get(x, 0.0)).astype(float)
+                    
+                    else:
+                        # Fallback: label encoding
+                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                        df[c] = df[c].fillna(-1)
+                
+                # Drop marked columns
+                if cols_to_drop:
+                    df = df.drop(columns=cols_to_drop)
+                    print(f"[INFO] Dropped {len(cols_to_drop)} constant/empty columns")
+                
+                # Final cleanup
+                for c in list(df.columns):
+                    if df[c].dtype == 'object':
+                        try:
+                            df[c] = pd.to_numeric(df[c], errors='coerce')
+                        except Exception:
+                            df[c] = df[c].astype('category').cat.codes.astype(float)
+                
+                df.replace([np.inf, -np.inf], np.nan, inplace=True)
+                
+                # Fill any remaining NaNs
+                for c in df.columns:
+                    if df[c].isna().any():
+                        if pd.api.types.is_numeric_dtype(df[c]):
+                            df[c] = df[c].fillna(df[c].median())
+                        else:
+                            df[c] = df[c].fillna(0)
+                
+                print(f"[INFO] Transformation complete: shape {df.shape}")
+                return df
+
+            def save(self, path):
+                with gzip.open(path, "wb") as f:
+                    cloudpickle.dump(self, f)
+                    
+            @staticmethod
+            def load(path):
+                with gzip.open(path, "rb") as f:
+                    return cloudpickle.load(f)
+
+        # Main execution
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--cleaned_data', type=str, required=True)
+        parser.add_argument('--cleaning_metadata', type=str, required=True)
+        parser.add_argument('--max_knn_rows', type=int, default=5000)
+        parser.add_argument('--rare_threshold', type=float, default=0.01)
+        parser.add_argument('--enable_string_similarity', type=str, default="false")
+        parser.add_argument('--create_interactions', type=str, default="false")
+        parser.add_argument('--interaction_degree', type=int, default=2)
+        parser.add_argument('--max_interaction_features', type=int, default=15)
+        parser.add_argument('--add_row_statistics', type=str, default="true")
+        parser.add_argument('--scaling_strategy', type=str, default="robust")
+        parser.add_argument('--preprocessed_data', type=str, required=True)
+        parser.add_argument('--preprocessor', type=str, required=True)
+        parser.add_argument('--preprocessing_metadata', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            print("="*80)
+            print("BRICK 2: FEATURE PREPROCESSING v2.0 - UNSUPERVISED/ANOMALY DETECTION")
+            print("="*80)
+            
+            # Parse boolean flags
+            enable_string_sim = str(args.enable_string_similarity).lower() in ("1", "true", "t", "yes", "y")
+            create_interactions = str(args.create_interactions).lower() in ("1", "true", "t", "yes", "y")
+            add_row_stats = str(args.add_row_statistics).lower() in ("1", "true", "t", "yes", "y")
+            
+            # Load cleaned data
+            print("[STEP 1/7] Loading cleaned data...")
+            data = pd.read_parquet(args.cleaned_data)
+            print(f"[INFO] Data shape: {data.shape}")
+            print(f"[INFO] Columns: {list(data.columns)[:10]}{'...' if len(data.columns) > 10 else ''}")
+            
+            # Load cleaning metadata
+            with open(args.cleaning_metadata, 'r') as f:
+                cleaning_meta = json.load(f)
+            
+            # Prepare config
+            config = {
+                'max_knn_rows': args.max_knn_rows,
+                'rare_threshold': args.rare_threshold,
+                'enable_string_similarity': enable_string_sim,
+                'create_interactions': create_interactions,
+                'interaction_degree': args.interaction_degree,
+                'max_interaction_features': args.max_interaction_features,
+                'add_row_statistics': add_row_stats,
+                'scaling_strategy': args.scaling_strategy
+            }
+            
+            print(f"[INFO] Configuration: {json.dumps(config, indent=2)}")
+            
+            # Fit Preprocessor
+            print("[STEP 2/7] Fitting preprocessor...")
+            preprocessor = UnsupervisedPreprocessor()
+            preprocessor.fit(data, config=config)
+            
+            print(f"[INFO] Numeric columns: {len(preprocessor.num_cols)}")
+            print(f"[INFO] Categorical columns: {len(preprocessor.cat_cols)}")
+            
+            # Transform data
+            print("[STEP 3/7] Transforming features...")
+            preprocessed = preprocessor.transform(data, training_mode=True)
+            print(f"[INFO] Preprocessed shape: {preprocessed.shape}")
+            
+            # Optimize dtypes
+            print("[STEP 4/7] Optimizing dtypes...")
+            for col in preprocessed.select_dtypes(include=[np.number]).columns:
+                try:
+                    preprocessed[col] = pd.to_numeric(preprocessed[col], downcast='float')
+                except Exception:
+                    pass
+            
+            # Verify no NaNs or Infs remain
+            print("[STEP 5/7] Final validation...")
+            nan_count = preprocessed.isna().sum().sum()
+            inf_count = np.isinf(preprocessed.select_dtypes(include=[np.number]).values).sum()
+            
+            if nan_count > 0:
+                print(f"[WARNING] {nan_count} NaN values remain - filling with 0")
+                preprocessed = preprocessed.fillna(0)
+            
+            if inf_count > 0:
+                print(f"[WARNING] {inf_count} Inf values remain - replacing with 0")
+                preprocessed = preprocessed.replace([np.inf, -np.inf], 0)
+            
+            print(f"[INFO] Final shape: {preprocessed.shape}")
+            print(f"[INFO] Data types: {preprocessed.dtypes.value_counts().to_dict()}")
+            
+            # Save outputs
+            print("[STEP 6/7] Saving outputs...")
+            ensure_dir_for(args.preprocessed_data)
+            ensure_dir_for(args.preprocessor)
+            ensure_dir_for(args.preprocessing_metadata)
+            
+            preprocessed.to_parquet(args.preprocessed_data, index=False)
+            print(f"[INFO] Saved preprocessed data to: {args.preprocessed_data}")
+            
+            preprocessor.save(args.preprocessor)
+            print(f"[INFO] Saved preprocessor to: {args.preprocessor}")
+            
+            # Create metadata
+            print("[STEP 7/7] Saving metadata...")
+            
+            # Collect encoder summary
+            encoder_summary = {}
+            for col in preprocessor.cat_cols:
+                cfg = preprocessor.col_config.get(col, {})
+                enc_type = cfg.get('encoder_type', 'unknown')
+                encoder_summary[col] = {
+                    'type': enc_type,
+                    'n_unique': cfg.get('n_unique', 0),
+                    'high_card': cfg.get('high_card', False)
+                }
+                if enc_type == 'onehot':
+                    encoder_summary[col]['n_categories'] = len(cfg.get('ohe_columns', []))
+                elif enc_type == 'frequency':
+                    encoder_summary[col]['n_categories'] = len(cfg.get('frequency_map', {}))
+            
+            # Numeric summary
+            numeric_summary = {}
+            for col in preprocessor.num_cols:
+                cfg = preprocessor.col_config.get(col, {})
+                numeric_summary[col] = {
+                    'missing_frac': cfg.get('missing_frac', 0.0),
+                    'imputer': cfg.get('imputer', ('none', None))[0],
+                    'scaler': type(cfg.get('scaler_obj')).__name__ if 'scaler_obj' in cfg else 'unknown'
+                }
+            
+            metadata = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'version': '2.0',
+                'mode': 'unsupervised',
+                'purpose': 'anomaly_detection_preprocessing',
+                'config': config,
+                'original_shape': {'rows': len(data), 'cols': len(data.columns)},
+                'final_shape': {'rows': len(preprocessed), 'cols': len(preprocessed.columns)},
+                'num_cols': preprocessor.num_cols,
+                'cat_cols': preprocessor.cat_cols,
+                'encoder_summary': encoder_summary,
+                'numeric_summary': numeric_summary,
+                'interaction_features': preprocessor.interaction_features,
+                'row_stat_features': preprocessor.row_stat_features,
+                'feature_names': list(preprocessed.columns),
+                'cleaning_metadata': cleaning_meta
+            }
+            
+            with open(args.preprocessing_metadata, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"[INFO] Saved metadata to: {args.preprocessing_metadata}")
+            
+            print(f"{'='*80}")
+            print("BRICK 2 COMPLETE - SUMMARY")
+            print(f"{'='*80}")
+            print(f"Input shape:            {data.shape}")
+            print(f"Output shape:           {preprocessed.shape}")
+            print(f"Numeric features:       {len(preprocessor.num_cols)}")
+            print(f"Categorical features:   {len(preprocessor.cat_cols)}")
+            print(f"Final feature count:    {preprocessed.shape[1]}")
+            print(f"Row statistics added:   {add_row_stats}")
+            print(f"Interactions created:   {create_interactions}")
+            print(f"Scaling strategy:       {args.scaling_strategy}")
+            print(f"NaN count:              {preprocessed.isna().sum().sum()}")
+            print(f"Inf count:              0")
+            print(f"{'='*80}")
+            print("SUCCESS: Preprocessing complete - Ready for Isolation Forest!")
+            print(f"{'='*80}")
+            
+        except Exception as exc:
+            print("ERROR during preprocessing: " + str(exc), file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --cleaned_data
+      - {inputPath: cleaned_data}
+      - --cleaning_metadata
+      - {inputPath: cleaning_metadata}
+      - --max_knn_rows
+      - {inputValue: max_knn_rows}
+      - --rare_threshold
+      - {inputValue: rare_threshold}
+      - --enable_string_similarity
+      - {inputValue: enable_string_similarity}
+      - --create_interactions
+      - {inputValue: create_interactions}
+      - --interaction_degree
+      - {inputValue: interaction_degree}
+      - --max_interaction_features
+      - {inputValue: max_interaction_features}
+      - --add_row_statistics
+      - {inputValue: add_row_statistics}
+      - --scaling_strategy
+      - {inputValue: scaling_strategy}
+      - --preprocessed_data
+      - {outputPath: preprocessed_data}
+      - --preprocessor
+      - {outputPath: preprocessor}
+      - --preprocessing_metadata
+      - {outputPath: preprocessing_metadata}
