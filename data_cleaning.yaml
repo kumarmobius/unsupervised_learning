@@ -1,4 +1,4 @@
-name: Data Cleaning v1.1 - Unsupervised
+name: Data Cleaning v1.2 - Unsupervised
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: missing_threshold, type: Float, description: "Drop columns with missing % above this", optional: true, default: "0.40"}
@@ -72,6 +72,14 @@ implementation:
                 raise ValueError("Input path not found: " + str(path))
 
             ext = os.path.splitext(path)[1].lower()
+            try:
+                with open(path, 'rb') as f:
+                    magic = f.read(4)
+                    if magic == b'PAR1':
+                        print("[INFO] Detected Parquet file by magic bytes")
+                        return pd.read_parquet(path)
+            except Exception:
+                pass
 
             # handle compressed csv/json (.gz) and zip containers
             if ext == ".gz":
