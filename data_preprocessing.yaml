@@ -1,15 +1,17 @@
-name: Feature Preprocessing v2.0 - Unsupervised
+name: Feature Preprocessing v3 - Anomaly Detection
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
   - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer", optional: true, default: "5000"}
-  - {name: rare_threshold, type: Float, description: "Rare label threshold for categorical", optional: true, default: "0.01"}
-  - {name: enable_string_similarity, type: String, description: "true/false for high-cardinality grouping", optional: true, default: "false"}
+  - {name: rare_threshold, type: Float, description: "Rare label threshold (use 0.0001 for anomaly detection)", optional: true, default: "0.005"}
+  - {name: enable_string_similarity, type: String, description: "true/false for high-cardinality grouping (use false for anomaly detection)", optional: true, default: "false"}
   - {name: create_interactions, type: String, description: "true/false to create polynomial interactions", optional: true, default: "false"}
   - {name: interaction_degree, type: Integer, description: "Polynomial degree for interactions", optional: true, default: "2"}
   - {name: max_interaction_features, type: Integer, description: "Max interaction features to create", optional: true, default: "15"}
-  - {name: add_row_statistics, type: String, description: "true/false to add per-row statistical features", optional: true, default: "true"}
-  - {name: scaling_strategy, type: String, description: "robust | standard | minmax | auto", optional: true, default: "robust"}
+  - {name: add_row_statistics, type: String, description: "true/false to add per-row statistical features (CRITICAL for anomaly detection)", optional: true, default: "true"}
+  - {name: add_missingness_indicators, type: String, description: "true/false to add missing value indicators (CRITICAL for anomaly detection)", optional: true, default: "true"}
+  - {name: add_rare_indicators, type: String, description: "true/false to add rare value indicators (CRITICAL for anomaly detection)", optional: true, default: "true"}
+  - {name: scaling_strategy, type: String, description: "robust | standard | minmax | none | auto", optional: true, default: "robust"}
 outputs:
   - {name: preprocessed_data, type: Dataset, description: "Preprocessed features ready for anomaly detection"}
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor cloudpickle"}
@@ -64,7 +66,9 @@ implementation:
             return series.map(lambda x: freq_map.get(x, 0.0)), freq_map
 
         def choose_scaler(strategy='auto', sample_series=None):
-            if strategy == 'robust':
+            if strategy == 'none':
+                return None
+            elif strategy == 'robust':
                 return RobustScaler()
             elif strategy == 'standard':
                 return StandardScaler()
@@ -180,7 +184,7 @@ implementation:
             new_features['row_skew'] = stats.skew(num_data, axis=1, nan_policy='omit')
             new_features['row_kurtosis'] = stats.kurtosis(num_data, axis=1, nan_policy='omit')
             
-            # Missing value pattern (important for anomaly detection)
+            # Missing value pattern (CRITICAL for anomaly detection)
             new_features['row_null_count'] = np.isnan(num_data).sum(axis=1)
             new_features['row_null_fraction'] = new_features['row_null_count'] / len(numeric_cols)
             
@@ -192,8 +196,8 @@ implementation:
             print(f"[INFO] Added {len(new_features)} row-level features")
             return df, feature_names
 
-        # Preprocessor Class for Unsupervised Learning
-        class UnsupervisedPreprocessor:
+        # Preprocessor Class for Anomaly Detection
+        class AnomalyDetectionPreprocessor:
             def __init__(self):
                 self.num_cols = []
                 self.cat_cols = []
@@ -202,6 +206,8 @@ implementation:
                 self.original_input_columns = []
                 self.interaction_features = []
                 self.row_stat_features = []
+                self.missingness_indicators = []
+                self.rare_indicators = []
 
             def fit(self, df, config=None):
                 self.global_metadata['config'] = config or {}
@@ -250,7 +256,7 @@ implementation:
                     cfg['n_unique'] = int(s.nunique(dropna=True))
                     cfg['missing_frac'] = float(s.isna().mean())
                     cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
-                    cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.01)
+                    cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.0001)
                     
                     # Choose encoding strategy
                     enc_name, enc_obj = choose_categorical_encoder(c, s, nrows)
@@ -287,6 +293,7 @@ implementation:
 
             def transform(self, df, training_mode=False):
                 df = df.copy()
+                cfg_global = self.global_metadata.get('config', {})
                 
                 print("[INFO] Starting transformation...")
                 
@@ -298,7 +305,34 @@ implementation:
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
                 
-                # NUMERIC IMPUTATION
+                # ========================================
+                # STEP 1: ADD MISSINGNESS INDICATORS (CRITICAL FOR ANOMALY DETECTION)
+                # ========================================
+                if training_mode and cfg_global.get('add_missingness_indicators', True):
+                    print("[INFO] Adding missingness indicator flags (anomaly detection feature)...")
+                    missing_flag_cols = []
+                    
+                    # Numeric missing indicators
+                    for c in self.num_cols:
+                        if c in df.columns and df[c].isna().any():
+                            flag_col = f'{c}_missing'
+                            df[flag_col] = df[c].isna().astype(int)
+                            missing_flag_cols.append(flag_col)
+                    
+                    # Categorical missing indicators
+                    for c in self.cat_cols:
+                        if c in df.columns and df[c].isna().any():
+                            flag_col = f'{c}_missing'
+                            df[flag_col] = df[c].isna().astype(int)
+                            missing_flag_cols.append(flag_col)
+                    
+                    self.missingness_indicators = missing_flag_cols
+                    if missing_flag_cols:
+                        print(f"[INFO] Added {len(missing_flag_cols)} missingness indicators")
+                
+                # ========================================
+                # STEP 2: NUMERIC IMPUTATION
+                # ========================================
                 print("[INFO] Imputing missing values...")
                 
                 # Prepare temporary df with median-filled values for KNN/Iterative
@@ -359,42 +393,54 @@ implementation:
                     if c in df.columns and df[c].isna().any():
                         df[c] = df[c].fillna(df[c].median())
                 
-                # NUMERIC SCALING
+                # ========================================
+                # STEP 3: NUMERIC SCALING
+                # ========================================
                 print("[INFO] Scaling numeric features...")
-                cfg_global = self.global_metadata.get('config', {})
                 scaling_strategy = cfg_global.get('scaling_strategy', 'robust')
                 
                 for c in self.num_cols:
                     if c not in df.columns:
                         continue
                     
+                    # Skip scaling if strategy is 'none'
+                    if scaling_strategy == 'none':
+                        print(f"[INFO] Skipping scaling for '{c}' (strategy=none)")
+                        continue
+                    
                     # Get or create scaler
                     if 'scaler_obj' not in self.col_config[c]:
                         scaler = choose_scaler(scaling_strategy, df[c])
+                        if scaler is not None:
+                            try:
+                                scaler.fit(df[[c]].fillna(0).values)
+                                self.col_config[c]['scaler_obj'] = scaler
+                            except Exception:
+                                scaler = RobustScaler()
+                                scaler.fit(df[[c]].fillna(0).values)
+                                self.col_config[c]['scaler_obj'] = scaler
+                    
+                    scaler = self.col_config[c].get('scaler_obj')
+                    
+                    if scaler is not None:
                         try:
-                            scaler.fit(df[[c]].fillna(0).values)
-                            self.col_config[c]['scaler_obj'] = scaler
-                        except Exception:
-                            scaler = RobustScaler()
-                            scaler.fit(df[[c]].fillna(0).values)
-                            self.col_config[c]['scaler_obj'] = scaler
-                    
-                    scaler = self.col_config[c]['scaler_obj']
-                    
-                    try:
-                        transformed = scaler.transform(df[[c]].fillna(0).values)
-                        df[c] = transformed.reshape(-1)
-                    except Exception as e:
-                        print(f"[WARNING] Scaling failed for '{c}': {e}")
-                        df[c] = StandardScaler().fit_transform(df[[c]].fillna(0).values).reshape(-1)
+                            transformed = scaler.transform(df[[c]].fillna(0).values)
+                            df[c] = transformed.reshape(-1)
+                        except Exception as e:
+                            print(f"[WARNING] Scaling failed for '{c}': {e}")
+                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(0).values).reshape(-1)
                 
-                # ROW STATISTICS (training only)
+                # ========================================
+                # STEP 4: ROW STATISTICS (CRITICAL FOR ANOMALY DETECTION)
+                # ========================================
                 if training_mode and cfg_global.get('add_row_statistics', True):
                     current_num_cols = [c for c in df.columns if c in self.num_cols]
                     df, row_stat_cols = add_row_statistics(df, current_num_cols)
                     self.row_stat_features = row_stat_cols
                 
-                # POLYNOMIAL INTERACTIONS (training only)
+                # ========================================
+                # STEP 5: POLYNOMIAL INTERACTIONS (optional)
+                # ========================================
                 if training_mode and cfg_global.get('create_interactions', False):
                     print("[INFO] Creating polynomial/interaction features...")
                     current_num_cols = [c for c in df.columns if c in self.num_cols]
@@ -408,9 +454,12 @@ implementation:
                         )
                         self.interaction_features = interaction_cols
                 
-                # CATEGORICAL ENCODING
+                # ========================================
+                # STEP 6: CATEGORICAL ENCODING WITH RARE INDICATORS
+                # ========================================
                 print("[INFO] Encoding categorical features...")
                 cols_to_drop = []
+                add_rare_indicators = training_mode and cfg_global.get('add_rare_indicators', True)
                 
                 for c in [cc for cc in self.cat_cols if cc in df.columns]:
                     cfg = self.col_config.get(c, {})
@@ -422,15 +471,28 @@ implementation:
                     
                     s = df[c].astype(object).fillna('__MISSING__')
                     
-                    # Collapse rare labels
-                    rare_thresh = cfg.get('rare_threshold_frac', 0.01)
+                    # ADD RARE VALUE INDICATORS (instead of aggressive collapsing)
+                    if add_rare_indicators:
+                        rare_thresh = cfg.get('rare_threshold_frac', 0.0001)
+                        counts = s.value_counts(dropna=False)
+                        n = len(s)
+                        rare_threshold = max(1, int(rare_thresh * n)) if rare_thresh > 0 else 0
+                        rare_values = set(counts[counts <= rare_threshold].index) if rare_threshold > 0 else set()
+                        
+                        if rare_values:
+                            rare_flag_col = f'{c}_is_rare'
+                            df[rare_flag_col] = s.isin(rare_values).astype(int)
+                            self.rare_indicators.append(rare_flag_col)
+                            if training_mode:
+                                cfg['rare_values'] = list(rare_values)
+                            print(f"[INFO] Added rare indicator for '{c}': {len(rare_values)} rare values")
+                    
+                    # Minimal rare label collapsing (with very low threshold)
+                    rare_thresh = cfg.get('rare_threshold_frac', 0.0001)
                     collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh)
                     df[c] = collapsed
                     
-                    if training_mode:
-                        cfg['rare_values'] = list(rare_set)
-                    
-                    # String similarity grouping (high cardinality)
+                    # String similarity grouping (disabled by default for anomaly detection)
                     if cfg_global.get('enable_string_similarity', False) and cfg.get('n_unique', 0) > 20:
                         grouped, mapping = string_similarity_group(df[c], score_threshold=90)
                         df[c] = grouped
@@ -469,7 +531,12 @@ implementation:
                     df = df.drop(columns=cols_to_drop)
                     print(f"[INFO] Dropped {len(cols_to_drop)} constant/empty columns")
                 
-                # Final cleanup
+                # ========================================
+                # STEP 7: FINAL CLEANUP
+                # ========================================
+                print("[INFO] Final cleanup and validation...")
+                
+                # Convert any remaining object columns
                 for c in list(df.columns):
                     if df[c].dtype == 'object':
                         try:
@@ -504,12 +571,14 @@ implementation:
         parser.add_argument('--cleaned_data', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
         parser.add_argument('--max_knn_rows', type=int, default=5000)
-        parser.add_argument('--rare_threshold', type=float, default=0.01)
+        parser.add_argument('--rare_threshold', type=float, default=0.0001)
         parser.add_argument('--enable_string_similarity', type=str, default="false")
         parser.add_argument('--create_interactions', type=str, default="false")
         parser.add_argument('--interaction_degree', type=int, default=2)
         parser.add_argument('--max_interaction_features', type=int, default=15)
         parser.add_argument('--add_row_statistics', type=str, default="true")
+        parser.add_argument('--add_missingness_indicators', type=str, default="true")
+        parser.add_argument('--add_rare_indicators', type=str, default="true")
         parser.add_argument('--scaling_strategy', type=str, default="robust")
         parser.add_argument('--preprocessed_data', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
@@ -518,13 +587,15 @@ implementation:
 
         try:
             print("="*80)
-            print("BRICK 2: FEATURE PREPROCESSING v2.0 - UNSUPERVISED/ANOMALY DETECTION")
+            print("BRICK 2: FEATURE PREPROCESSING v2.1 - OPTIMIZED FOR ANOMALY DETECTION")
             print("="*80)
             
             # Parse boolean flags
             enable_string_sim = str(args.enable_string_similarity).lower() in ("1", "true", "t", "yes", "y")
             create_interactions = str(args.create_interactions).lower() in ("1", "true", "t", "yes", "y")
             add_row_stats = str(args.add_row_statistics).lower() in ("1", "true", "t", "yes", "y")
+            add_miss_ind = str(args.add_missingness_indicators).lower() in ("1", "true", "t", "yes", "y")
+            add_rare_ind = str(args.add_rare_indicators).lower() in ("1", "true", "t", "yes", "y")
             
             # Load cleaned data
             print("[STEP 1/7] Loading cleaned data...")
@@ -545,14 +616,22 @@ implementation:
                 'interaction_degree': args.interaction_degree,
                 'max_interaction_features': args.max_interaction_features,
                 'add_row_statistics': add_row_stats,
+                'add_missingness_indicators': add_miss_ind,
+                'add_rare_indicators': add_rare_ind,
                 'scaling_strategy': args.scaling_strategy
             }
             
-            print(f"[INFO] Configuration: {json.dumps(config, indent=2)}")
+            print(f"[INFO] Configuration:")
+            print(f"  - Rare threshold: {args.rare_threshold} (lower = preserve more rare values)")
+            print(f"  - String similarity: {enable_string_sim} (false = preserve distinct categories)")
+            print(f"  - Row statistics: {add_row_stats} (CRITICAL for anomaly detection)")
+            print(f"  - Missingness indicators: {add_miss_ind} (CRITICAL for anomaly detection)")
+            print(f"  - Rare indicators: {add_rare_ind} (CRITICAL for anomaly detection)")
+            print(f"  - Scaling strategy: {args.scaling_strategy}")
             
             # Fit Preprocessor
             print("[STEP 2/7] Fitting preprocessor...")
-            preprocessor = UnsupervisedPreprocessor()
+            preprocessor = AnomalyDetectionPreprocessor()
             preprocessor.fit(data, config=config)
             
             print(f"[INFO] Numeric columns: {len(preprocessor.num_cols)}")
@@ -624,14 +703,21 @@ implementation:
                 numeric_summary[col] = {
                     'missing_frac': cfg.get('missing_frac', 0.0),
                     'imputer': cfg.get('imputer', ('none', None))[0],
-                    'scaler': type(cfg.get('scaler_obj')).__name__ if 'scaler_obj' in cfg else 'unknown'
+                    'scaler': type(cfg.get('scaler_obj')).__name__ if 'scaler_obj' in cfg else 'none'
                 }
             
             metadata = {
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
-                'version': '2.0',
+                'version': '2.1',
                 'mode': 'unsupervised',
                 'purpose': 'anomaly_detection_preprocessing',
+                'optimizations': {
+                    'missingness_indicators_added': add_miss_ind,
+                    'rare_value_indicators_added': add_rare_ind,
+                    'minimal_rare_collapsing': args.rare_threshold <= 0.001,
+                    'string_similarity_disabled': not enable_string_sim,
+                    'row_statistics_enabled': add_row_stats
+                },
                 'config': config,
                 'original_shape': {'rows': len(data), 'cols': len(data.columns)},
                 'final_shape': {'rows': len(preprocessed), 'cols': len(preprocessed.columns)},
@@ -641,6 +727,8 @@ implementation:
                 'numeric_summary': numeric_summary,
                 'interaction_features': preprocessor.interaction_features,
                 'row_stat_features': preprocessor.row_stat_features,
+                'missingness_indicators': preprocessor.missingness_indicators,
+                'rare_indicators': preprocessor.rare_indicators,
                 'feature_names': list(preprocessed.columns),
                 'cleaning_metadata': cleaning_meta
             }
@@ -651,20 +739,23 @@ implementation:
             print(f"[INFO] Saved metadata to: {args.preprocessing_metadata}")
             
             print(f"{'='*80}")
-            print("BRICK 2 COMPLETE - SUMMARY")
+            print("BRICK 2 COMPLETE - ANOMALY DETECTION READY")
             print(f"{'='*80}")
-            print(f"Input shape:            {data.shape}")
-            print(f"Output shape:           {preprocessed.shape}")
-            print(f"Numeric features:       {len(preprocessor.num_cols)}")
-            print(f"Categorical features:   {len(preprocessor.cat_cols)}")
-            print(f"Final feature count:    {preprocessed.shape[1]}")
-            print(f"Row statistics added:   {add_row_stats}")
-            print(f"Interactions created:   {create_interactions}")
-            print(f"Scaling strategy:       {args.scaling_strategy}")
-            print(f"NaN count:              {preprocessed.isna().sum().sum()}")
-            print(f"Inf count:              0")
+            print(f"Input shape:                {data.shape}")
+            print(f"Output shape:               {preprocessed.shape}")
+            print(f"Numeric features:           {len(preprocessor.num_cols)}")
+            print(f"Categorical features:       {len(preprocessor.cat_cols)}")
+            print(f"Missingness indicators:     {len(preprocessor.missingness_indicators)}")
+            print(f"Rare value indicators:      {len(preprocessor.rare_indicators)}")
+            print(f"Row statistics:             {len(preprocessor.row_stat_features)}")
+            print(f"Interaction features:       {len(preprocessor.interaction_features)}")
+            print(f"Final feature count:        {preprocessed.shape[1]}")
+            print(f"Scaling strategy:           {args.scaling_strategy}")
+            print(f"Rare threshold:             {args.rare_threshold}")
+            print(f"NaN count:                  {preprocessed.isna().sum().sum()}")
+            print(f"Inf count:                  0")
             print(f"{'='*80}")
-            print("SUCCESS: Preprocessing complete - Ready for Isolation Forest!")
+            print(" OPTIMIZED FOR ISOLATION FOREST!")
             print(f"{'='*80}")
             
         except Exception as exc:
@@ -690,6 +781,10 @@ implementation:
       - {inputValue: max_interaction_features}
       - --add_row_statistics
       - {inputValue: add_row_statistics}
+      - --add_missingness_indicators
+      - {inputValue: add_missingness_indicators}
+      - --add_rare_indicators
+      - {inputValue: add_rare_indicators}
       - --scaling_strategy
       - {inputValue: scaling_strategy}
       - --preprocessed_data
