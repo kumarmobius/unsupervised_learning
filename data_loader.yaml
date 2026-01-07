@@ -160,9 +160,14 @@ implementation:
         print(f"Final dataset shape: {df.shape}")
         print(df.head(3).to_string())
 
-        # Save single output
-        os.makedirs(os.path.dirname(args.output_data) or ".", exist_ok=True)
-        df.to_parquet(args.output_data, index=False)
+        # FIXED: Ensure .parquet extension for proper format detection
+        output_path = args.output_data
+        if not output_path.endswith('.parquet'):
+            output_path = output_path + '.parquet'
+        
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        df.to_parquet(output_path, index=False)
+        logger.info(f"Data saved to: {output_path}")
         logger.info("Data fetching and saving completed successfully")
 
     args:
