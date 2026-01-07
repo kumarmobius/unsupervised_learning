@@ -1,4 +1,4 @@
-name: Data Cleaning v2.0 - Unsupervised
+name: Data Cleaning v1.0 - Unsupervised
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: missing_threshold, type: Float, description: "Drop columns with missing % above this", optional: true, default: "0.40"}
@@ -7,7 +7,7 @@ inputs:
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
   - {name: use_column, type: String, description: "Comma-separated list of columns to use (if empty, use all columns)", optional: true, default: ""}
   - {name: exclude_column, type: String, description: "Comma-separated list of columns to exclude", optional: true, default: ""}
-  - {name: drop_constant_columns, type: Boolean, description: "Drop columns with only one unique value", optional: true, default: "true"}
+  - {name: drop_constant_columns, type: String, description: "Drop columns with only one unique value: 'true' or 'false'", optional: true, default: "true"}
   - {name: handle_missing_strategy, type: String, description: "Strategy for missing values: 'drop_rows', 'keep', 'drop_cols_only'", optional: true, default: "keep"}
 outputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset parquet"}
