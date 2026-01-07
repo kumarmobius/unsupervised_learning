@@ -1,8 +1,9 @@
-name: Data loader v1-unsupervised
+name: Data loader v2-unsupervised
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
   - {name: sample_fraction, type: Float, default: "1.0", description: 'Optional fraction to randomly sample the fetched data (0.0 < f <= 1.0)'}
+  - {name: page_size, type: Integer, default: "2000", description: 'Number of records per page (if server allows override)'}
 outputs:
   - {name: data, type: Dataset}
 
@@ -27,6 +28,7 @@ implementation:
         parser.add_argument('--api_url', type=str, required=True)
         parser.add_argument('--access_token', type=str, required=True)
         parser.add_argument('--sample_fraction', type=float, default=1.0)
+        parser.add_argument('--page_size', type=int, default=2000)
         parser.add_argument('--output_data', type=str, required=True)
         args = parser.parse_args()
 
@@ -68,6 +70,7 @@ implementation:
             if isinstance(body, list):
                 return body
             if isinstance(body, dict):
+                # Try common keys for paginated responses
                 for key in ["data", "content", "records", "results", "items"]:
                     if key in body and isinstance(body[key], list):
                         return body[key]
@@ -80,95 +83,188 @@ implementation:
             total_instances = None
 
             if isinstance(body, dict):
+                # Direct keys
                 page_size = body.get("pageSize")
                 total_pages = body.get("totalPages")
                 total_instances = body.get("totalInstances")
+                
+                # Nested in 'page' object
                 if "page" in body and isinstance(body["page"], dict):
                     p = body["page"]
-                    page_size = page_size or p.get("pageSize")
+                    page_size = page_size or p.get("pageSize") or p.get("size")
                     total_pages = total_pages or p.get("totalPages")
-                    total_instances = total_instances or p.get("totalInstances")
+                    total_instances = total_instances or p.get("totalInstances") or p.get("totalElements")
+                
+                # Alternative keys
+                total_instances = total_instances or body.get("total") or body.get("totalElements")
+                
             return page_size, total_pages, total_instances
 
-        # === METADATA DISCOVERY ===
-        initial_size = 2000
+        # === STEP 1: METADATA DISCOVERY ===
+        logger.info("="*80)
+        logger.info("STEP 1: METADATA DISCOVERY")
+        logger.info("="*80)
+        
         base_url = args.api_url.rstrip('/')
         separator = '&' if '?' in base_url else '?'
+        
+        # Request first page with metadata flag
+        initial_size = args.page_size
         meta_url = f"{base_url}{separator}page=0&size={initial_size}&showPageableMetaData=true"
-
-        logger.info("Step 1: Metadata discovery request")
+        
+        logger.info(f"Requesting metadata from: {meta_url}")
         try:
             resp_meta = session.post(meta_url, headers=headers, json=payload, timeout=30)
             resp_meta.raise_for_status()
             body_meta = resp_meta.json()
+            logger.info("✓ Metadata request successful")
         except requests.exceptions.RequestException as e:
-            logger.error(f"Metadata request failed: {e}")
+            logger.error(f"✗ Metadata request failed: {e}")
             raise
 
+        # Parse pagination info
         detected_page_size, total_pages, total_instances = discover_page_metadata(body_meta)
-        logger.info(f"Detected: pageSize={detected_page_size}, totalPages={total_pages}, totalInstances={total_instances}")
+        
+        logger.info("-" * 80)
+        logger.info("PAGINATION METADATA:")
+        logger.info(f"  Server Page Size: {detected_page_size}")
+        logger.info(f"  Total Pages: {total_pages}")
+        logger.info(f"  Total Instances: {total_instances}")
+        logger.info("-" * 80)
 
+        # Determine effective page size
         if detected_page_size:
             page_size = min(detected_page_size, initial_size)
-            logger.info(f"Using server pageSize: {page_size}")
+            logger.info(f"Using server-provided page size: {page_size}")
         else:
             inferred_records = extract_records(body_meta)
             page_size = len(inferred_records) if inferred_records else initial_size
-            logger.info(f"Inferred pageSize from response: {page_size}")
+            logger.info(f"Inferred page size from first response: {page_size}")
 
+        # Calculate total pages if not provided
         if total_pages is None and total_instances:
             total_pages = (total_instances + page_size - 1) // page_size
-            logger.info(f"Calculated totalPages from totalInstances: {total_pages}")
+            logger.info(f"Calculated total pages from total instances: {total_pages}")
+        elif total_pages is None:
+            # Fallback: will fetch until empty response
+            logger.warning("⚠ No pagination metadata available. Will fetch pages until empty.")
 
-        # === PAGINATION ===
+        # === STEP 2: PAGINATED DATA COLLECTION ===
+        logger.info("")
+        logger.info("="*80)
+        logger.info("STEP 2: FETCHING PAGINATED DATA")
+        logger.info("="*80)
+        
         all_records = []
+        
         if total_pages is None:
-            logger.warning("No pagination metadata found. Assuming single-page API.")
-            all_records.extend(extract_records(body_meta))
+            # Unknown pagination - fetch until empty
+            logger.info("Mode: Fetch until empty response")
+            page = 0
+            consecutive_empty = 0
+            max_consecutive_empty = 3
+            
+            while consecutive_empty < max_consecutive_empty:
+                page_url = f"{base_url}{separator}page={page}&size={page_size}&showPageableMetaData=true"
+                logger.info(f"Fetching page {page} (unknown total)...")
+                
+                try:
+                    resp_page = session.post(page_url, headers=headers, json=payload, timeout=30)
+                    resp_page.raise_for_status()
+                    body_page = resp_page.json()
+                    records = extract_records(body_page)
+                    
+                    if not records:
+                        consecutive_empty += 1
+                        logger.info(f"  ⚠ Empty page {page} (consecutive: {consecutive_empty}/{max_consecutive_empty})")
+                        if consecutive_empty >= max_consecutive_empty:
+                            logger.info("  Stopping: reached max consecutive empty pages")
+                            break
+                    else:
+                        consecutive_empty = 0
+                        all_records.extend(records)
+                        logger.info(f"  ✓ Page {page}: Retrieved {len(records)} records (total: {len(all_records)})")
+                    
+                    page += 1
+                    
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"✗ Failed to fetch page {page}: {e}")
+                    raise
         else:
-            logger.info(f"Fetching {total_pages} pages with size {page_size}")
+            # Known pagination
+            logger.info(f"Mode: Fetching {total_pages} pages with size {page_size}")
+            logger.info(f"Expected total records: ~{total_instances or total_pages * page_size}")
+            
             for page in range(total_pages):
                 page_url = f"{base_url}{separator}page={page}&size={page_size}&showPageableMetaData=true"
-                logger.info(f"Fetching page {page + 1}/{total_pages}")
+                logger.info(f"Fetching page {page + 1}/{total_pages}...")
+                
                 try:
                     resp_page = session.post(page_url, headers=headers, json=payload, timeout=30)
                     resp_page.raise_for_status()
                     body_page = resp_page.json()
                     records = extract_records(body_page)
                     all_records.extend(records)
-                    logger.info(f"Page {page + 1}: Retrieved {len(records)} records")
+                    logger.info(f"  ✓ Retrieved {len(records)} records (cumulative: {len(all_records)})")
+                    
                 except requests.exceptions.RequestException as e:
-                    logger.error(f"Failed to fetch page {page}: {e}")
+                    logger.error(f"✗ Failed to fetch page {page}: {e}")
                     raise
 
-        logger.info(f"Total records collected: {len(all_records)}")
+        logger.info("")
+        logger.info("="*80)
+        logger.info(f"COLLECTION COMPLETE: {len(all_records)} total records")
+        logger.info("="*80)
+        
         if not all_records:
             raise ValueError("No records retrieved from API")
 
+        # === STEP 3: DATAFRAME CREATION ===
+        logger.info("")
+        logger.info("STEP 3: Creating DataFrame...")
         df = pd.DataFrame(all_records)
+        logger.info(f"  DataFrame shape: {df.shape}")
+        logger.info(f"  Columns: {list(df.columns)}")
 
-        # Optional: downsample if requested
+        # === STEP 4: OPTIONAL SAMPLING ===
         if not (0.0 < args.sample_fraction <= 1.0):
             raise ValueError("sample_fraction must be in (0.0, 1.0].")
-        if args.sample_fraction < 1.0:
-            df = df.sample(frac=args.sample_fraction, random_state=42).reset_index(drop=True)
-            logger.info(f"Sampled dataset with fraction {args.sample_fraction}; new shape {df.shape}")
-
-        # Diagnostics
-        print("===== PAGINATION SUMMARY =====")
-        print(f"Total records fetched: {len(all_records)}")
-        print(f"Final dataset shape: {df.shape}")
-        print(df.head(3).to_string())
-
-        # FIXED: Ensure .parquet extension for proper format detection
-        output_path = args.output_data
-        if not output_path.endswith('.parquet'):
-            output_path = output_path + '.parquet'
         
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        df.to_parquet(output_path, index=False)
-        logger.info(f"Data saved to: {output_path}")
-        logger.info("Data fetching and saving completed successfully")
+        if args.sample_fraction < 1.0:
+            logger.info("")
+            logger.info(f"STEP 4: Sampling {args.sample_fraction*100:.1f}% of data...")
+            original_size = len(df)
+            df = df.sample(frac=args.sample_fraction, random_state=42).reset_index(drop=True)
+            logger.info(f"  Sampled: {original_size} → {len(df)} rows")
+
+        # === STEP 5: SAVE OUTPUT ===
+        logger.info("")
+        logger.info("STEP 5: Saving data...")
+        
+        # Create directory if needed
+        output_dir = os.path.dirname(args.output_data)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
+        # Save as Parquet (Argo will handle archiving)
+        df.to_parquet(args.output_data, index=False)
+        logger.info(f"  ✓ Saved to: {args.output_data}")
+        logger.info(f"  Format: Parquet")
+        logger.info(f"  Size: {os.path.getsize(args.output_data) / (1024*1024):.2f} MB")
+
+        # === FINAL SUMMARY ===
+        logger.info("")
+        logger.info("="*80)
+        logger.info("FINAL DATA SUMMARY")
+        logger.info("="*80)
+        logger.info(f"Total records fetched: {len(all_records)}")
+        logger.info(f"Final dataset shape: {df.shape}")
+        logger.info(f"Memory usage: {df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB")
+        logger.info("")
+        logger.info("First 3 rows:")
+        print(df.head(3).to_string())
+        logger.info("")
+        logger.info("✓ Data fetching and saving completed successfully")
 
     args:
       - --api_url
@@ -177,5 +273,7 @@ implementation:
       - {inputPath: access_token}
       - --sample_fraction
       - {inputValue: sample_fraction}
+      - --page_size
+      - {inputValue: page_size}
       - --output_data
       - {outputPath: data}
