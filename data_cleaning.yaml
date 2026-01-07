@@ -1,4 +1,4 @@
-name: Data Cleaning v1.0 - Unsupervised
+name: Data Cleaning v1.1 - Unsupervised
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: missing_threshold, type: Float, description: "Drop columns with missing % above this", optional: true, default: "0.40"}
@@ -80,7 +80,7 @@ implementation:
                         sample = fh.read(8192)
                         fh.seek(0)
                         # prefer json if it looks like json lines
-                        if sample.lstrip().startswith("{") or "\n{" in sample:
+                        if sample.lstrip().startswith("{") or "\\n{" in sample:
                             fh.seek(0)
                             return pd.read_json(fh, lines=True)
                         fh.seek(0)
@@ -98,7 +98,7 @@ implementation:
                     with z.open(member) as fh:
                         sample = fh.read(8192)
                         # json?
-                        if sample.lstrip().startswith(b"{") or b"\n{" in sample:
+                        if sample.lstrip().startswith(b"{") or b"\\n{" in sample:
                             with z.open(member) as fh2:
                                 return pd.read_json(io.TextIOWrapper(fh2, encoding="utf-8"), lines=True)
                         else:
