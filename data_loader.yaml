@@ -1,0 +1,176 @@
+name: Data loader v1-unsupervised
+inputs:
+  - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
+  - {name: access_token, type: string, description: 'Bearer access token for API auth'}
+  - {name: sample_fraction, type: Float, default: "1.0", description: 'Optional fraction to randomly sample the fetched data (0.0 < f <= 1.0)'}
+outputs:
+  - {name: data, type: Dataset}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import pandas as pd
+        import numpy as np
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        import logging
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--api_url', type=str, required=True)
+        parser.add_argument('--access_token', type=str, required=True)
+        parser.add_argument('--sample_fraction', type=float, default=1.0)
+        parser.add_argument('--output_data', type=str, required=True)
+        args = parser.parse_args()
+
+        # Read access token
+        with open(args.access_token, 'r') as f:
+            access_token = f.read().strip()
+
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("api_pagination_unsupervised")
+
+        session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}"
+        }
+
+        payload = {
+            "dbType": "TIDB",
+            "entityId": "",
+            "entityIds": [],
+            "ownedOnly": False,
+            "projections": [],
+            "filter": {},
+            "startTime": 0,
+            "endTime": 0
+        }
+
+        def extract_records(body):
+            if isinstance(body, list):
+                return body
+            if isinstance(body, dict):
+                for key in ["data", "content", "records", "results", "items"]:
+                    if key in body and isinstance(body[key], list):
+                        return body[key]
+                return [body]
+            return []
+
+        def discover_page_metadata(body):
+            page_size = None
+            total_pages = None
+            total_instances = None
+
+            if isinstance(body, dict):
+                page_size = body.get("pageSize")
+                total_pages = body.get("totalPages")
+                total_instances = body.get("totalInstances")
+                if "page" in body and isinstance(body["page"], dict):
+                    p = body["page"]
+                    page_size = page_size or p.get("pageSize")
+                    total_pages = total_pages or p.get("totalPages")
+                    total_instances = total_instances or p.get("totalInstances")
+            return page_size, total_pages, total_instances
+
+        # === METADATA DISCOVERY ===
+        initial_size = 2000
+        base_url = args.api_url.rstrip('/')
+        separator = '&' if '?' in base_url else '?'
+        meta_url = f"{base_url}{separator}page=0&size={initial_size}&showPageableMetaData=true"
+
+        logger.info("Step 1: Metadata discovery request")
+        try:
+            resp_meta = session.post(meta_url, headers=headers, json=payload, timeout=30)
+            resp_meta.raise_for_status()
+            body_meta = resp_meta.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Metadata request failed: {e}")
+            raise
+
+        detected_page_size, total_pages, total_instances = discover_page_metadata(body_meta)
+        logger.info(f"Detected: pageSize={detected_page_size}, totalPages={total_pages}, totalInstances={total_instances}")
+
+        if detected_page_size:
+            page_size = min(detected_page_size, initial_size)
+            logger.info(f"Using server pageSize: {page_size}")
+        else:
+            inferred_records = extract_records(body_meta)
+            page_size = len(inferred_records) if inferred_records else initial_size
+            logger.info(f"Inferred pageSize from response: {page_size}")
+
+        if total_pages is None and total_instances:
+            total_pages = (total_instances + page_size - 1) // page_size
+            logger.info(f"Calculated totalPages from totalInstances: {total_pages}")
+
+        # === PAGINATION ===
+        all_records = []
+        if total_pages is None:
+            logger.warning("No pagination metadata found. Assuming single-page API.")
+            all_records.extend(extract_records(body_meta))
+        else:
+            logger.info(f"Fetching {total_pages} pages with size {page_size}")
+            for page in range(total_pages):
+                page_url = f"{base_url}{separator}page={page}&size={page_size}&showPageableMetaData=true"
+                logger.info(f"Fetching page {page + 1}/{total_pages}")
+                try:
+                    resp_page = session.post(page_url, headers=headers, json=payload, timeout=30)
+                    resp_page.raise_for_status()
+                    body_page = resp_page.json()
+                    records = extract_records(body_page)
+                    all_records.extend(records)
+                    logger.info(f"Page {page + 1}: Retrieved {len(records)} records")
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Failed to fetch page {page}: {e}")
+                    raise
+
+        logger.info(f"Total records collected: {len(all_records)}")
+        if not all_records:
+            raise ValueError("No records retrieved from API")
+
+        df = pd.DataFrame(all_records)
+
+        # Optional: downsample if requested
+        if not (0.0 < args.sample_fraction <= 1.0):
+            raise ValueError("sample_fraction must be in (0.0, 1.0].")
+        if args.sample_fraction < 1.0:
+            df = df.sample(frac=args.sample_fraction, random_state=42).reset_index(drop=True)
+            logger.info(f"Sampled dataset with fraction {args.sample_fraction}; new shape {df.shape}")
+
+        # Diagnostics
+        print("===== PAGINATION SUMMARY =====")
+        print(f"Total records fetched: {len(all_records)}")
+        print(f"Final dataset shape: {df.shape}")
+        print(df.head(3).to_string())
+
+        # Save single output
+        os.makedirs(os.path.dirname(args.output_data) or ".", exist_ok=True)
+        df.to_parquet(args.output_data, index=False)
+        logger.info("Data fetching and saving completed successfully")
+
+    args:
+      - --api_url
+      - {inputValue: api_url}
+      - --access_token
+      - {inputPath: access_token}
+      - --sample_fraction
+      - {inputValue: sample_fraction}
+      - --output_data
+      - {outputPath: data}
