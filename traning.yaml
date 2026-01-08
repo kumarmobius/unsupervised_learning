@@ -1,0 +1,406 @@
+name: Isolation Forest Training v1.0
+inputs:
+  - {name: preprocessed_data, type: Dataset, description: "Preprocessed features from preprocessing step"}
+  - {name: preprocessing_metadata, type: Data, description: "Metadata from preprocessing step", optional: true}
+  - {name: n_estimators, type: Integer, description: "Number of base estimators (trees) in the ensemble", optional: true, default: "100"}
+  - {name: max_samples, type: String, description: "Number of samples to draw: 'auto', integer, or float (0.0-1.0)", optional: true, default: "auto"}
+  - {name: contamination, type: String, description: "Proportion of outliers: 'auto', or float (0.0-0.5)", optional: true, default: "auto"}
+  - {name: max_features, type: Float, description: "Number of features to draw: float (0.0-1.0) or 1.0 for all", optional: true, default: "1.0"}
+  - {name: bootstrap, type: String, description: "true/false - Whether to use bootstrap sampling", optional: true, default: "false"}
+  - {name: n_jobs, type: Integer, description: "Number of parallel jobs (-1 for all cores)", optional: true, default: "-1"}
+  - {name: random_state, type: Integer, description: "Random seed for reproducibility", optional: true, default: "42"}
+  - {name: verbose, type: Integer, description: "Verbosity level (0=silent, 1=progress, 2=detailed)", optional: true, default: "0"}
+  - {name: warm_start, type: String, description: "true/false - Reuse solution of previous call to fit", optional: true, default: "false"}
+outputs:
+  - {name: trained_model, type: Model, description: "Trained Isolation Forest model (cloudpickle)"}
+  - {name: training_metadata, type: Data, description: "JSON metadata with training statistics"}
+  - {name: anomaly_scores, type: Dataset, description: "Training data with anomaly scores and predictions"}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, traceback, gzip, warnings
+        from datetime import datetime
+        import pandas as pd, numpy as np
+        from sklearn.ensemble import IsolationForest
+        import cloudpickle
+        
+        warnings.filterwarnings('ignore')
+        
+        # Helper functions
+        def ensure_dir_for(p):
+            d=os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+        
+        def parse_max_samples(value_str, n_samples):
+            if value_str == 'auto':
+                return 'auto'
+            
+            try:
+                # Try as integer first
+                val = int(value_str)
+                if val > 0 and val <= n_samples:
+                    return val
+                else:
+                    print(f"[WARNING] max_samples {val} out of range, using 'auto'")
+                    return 'auto'
+            except ValueError:
+                pass
+            
+            try:
+                # Try as float
+                val = float(value_str)
+                if 0.0 < val <= 1.0:
+                    return val
+                else:
+                    print(f"[WARNING] max_samples {val} out of range (0.0-1.0), using 'auto'")
+                    return 'auto'
+            except ValueError:
+                print(f"[WARNING] Invalid max_samples '{value_str}', using 'auto'")
+                return 'auto'
+        
+        def parse_contamination(value_str):
+            if value_str == 'auto':
+                return 'auto'
+            
+            try:
+                val = float(value_str)
+                if 0.0 < val <= 0.5:
+                    return val
+                else:
+                    print(f"[WARNING] contamination {val} out of range (0.0-0.5), using 'auto'")
+                    return 'auto'
+            except ValueError:
+                print(f"[WARNING] Invalid contamination '{value_str}', using 'auto'")
+                return 'auto'
+        
+        def calculate_anomaly_statistics(scores, predictions):
+            stats = {}
+            
+            # Basic counts
+            stats['total_samples'] = len(predictions)
+            stats['normal_count'] = int((predictions == 1).sum())
+            stats['anomaly_count'] = int((predictions == -1).sum())
+            stats['anomaly_percentage'] = float(stats['anomaly_count'] / stats['total_samples'] * 100)
+            
+            # Score statistics
+            stats['score_mean'] = float(np.mean(scores))
+            stats['score_std'] = float(np.std(scores))
+            stats['score_min'] = float(np.min(scores))
+            stats['score_max'] = float(np.max(scores))
+            stats['score_median'] = float(np.median(scores))
+            stats['score_q25'] = float(np.percentile(scores, 25))
+            stats['score_q75'] = float(np.percentile(scores, 75))
+            
+            # Anomaly score statistics
+            anomaly_scores = scores[predictions == -1]
+            if len(anomaly_scores) > 0:
+                stats['anomaly_score_mean'] = float(np.mean(anomaly_scores))
+                stats['anomaly_score_std'] = float(np.std(anomaly_scores))
+                stats['anomaly_score_min'] = float(np.min(anomaly_scores))
+                stats['anomaly_score_max'] = float(np.max(anomaly_scores))
+            else:
+                stats['anomaly_score_mean'] = None
+                stats['anomaly_score_std'] = None
+                stats['anomaly_score_min'] = None
+                stats['anomaly_score_max'] = None
+            
+            # Normal score statistics
+            normal_scores = scores[predictions == 1]
+            if len(normal_scores) > 0:
+                stats['normal_score_mean'] = float(np.mean(normal_scores))
+                stats['normal_score_std'] = float(np.std(normal_scores))
+                stats['normal_score_min'] = float(np.min(normal_scores))
+                stats['normal_score_max'] = float(np.max(normal_scores))
+            else:
+                stats['normal_score_mean'] = None
+                stats['normal_score_std'] = None
+                stats['normal_score_min'] = None
+                stats['normal_score_max'] = None
+            
+            return stats
+        
+        def get_feature_importance_proxy(model, feature_names, X):
+            print("[INFO] Calculating feature importance (may take a moment)...")
+            
+            base_scores = model.decision_function(X)
+            importances = {}
+            
+            # Sample subset for speed if dataset is large
+            n_samples = min(1000, len(X))
+            indices = np.random.choice(len(X), n_samples, replace=False)
+            X_sample = X[indices]
+            base_scores_sample = model.decision_function(X_sample)
+            
+            for i, feature in enumerate(feature_names[:50]):  # Limit to top 50 features for speed
+                X_shuffled = X_sample.copy()
+                np.random.shuffle(X_shuffled[:, i])
+                shuffled_scores = model.decision_function(X_shuffled)
+                
+                # Measure impact as mean absolute difference in scores
+                importance = np.mean(np.abs(shuffled_scores - base_scores_sample))
+                importances[feature] = float(importance)
+            
+            # Sort by importance
+            sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
+            
+            return sorted_importances
+        
+        # Main execution
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--preprocessed_data', type=str, required=True)
+        parser.add_argument('--preprocessing_metadata', type=str, default='')
+        parser.add_argument('--n_estimators', type=int, default=100)
+        parser.add_argument('--max_samples', type=str, default='auto')
+        parser.add_argument('--contamination', type=str, default='auto')
+        parser.add_argument('--max_features', type=float, default=1.0)
+        parser.add_argument('--bootstrap', type=str, default='false')
+        parser.add_argument('--n_jobs', type=int, default=-1)
+        parser.add_argument('--random_state', type=int, default=42)
+        parser.add_argument('--verbose', type=int, default=0)
+        parser.add_argument('--warm_start', type=str, default='false')
+        parser.add_argument('--trained_model', type=str, required=True)
+        parser.add_argument('--training_metadata', type=str, required=True)
+        parser.add_argument('--anomaly_scores', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            print("="*80)
+            print("BRICK 3: ISOLATION FOREST TRAINING v1.0")
+            print("="*80)
+            
+            # Parse boolean flags
+            bootstrap = str(args.bootstrap).lower() in ("1", "true", "t", "yes", "y")
+            warm_start = str(args.warm_start).lower() in ("1", "true", "t", "yes", "y")
+            
+            # Load preprocessed data
+            print("[STEP 1/8] Loading preprocessed data...")
+            data = pd.read_parquet(args.preprocessed_data)
+            print(f"[INFO] Data shape: {data.shape}")
+            print(f"[INFO] Features: {data.shape[1]}")
+            print(f"[INFO] Samples: {data.shape[0]}")
+            
+            # Validate data
+            if data.shape[0] == 0:
+                print("[ERROR] Empty dataset", file=sys.stderr)
+                sys.exit(1)
+            
+            if data.shape[1] == 0:
+                print("[ERROR] No features in dataset", file=sys.stderr)
+                sys.exit(1)
+            
+            # Check for NaN or Inf
+            nan_count = data.isna().sum().sum()
+            inf_count = np.isinf(data.select_dtypes(include=[np.number]).values).sum()
+            
+            if nan_count > 0:
+                print(f"[WARNING] Found {nan_count} NaN values - filling with 0")
+                data = data.fillna(0)
+            
+            if inf_count > 0:
+                print(f"[WARNING] Found {inf_count} Inf values - replacing with 0")
+                data = data.replace([np.inf, -np.inf], 0)
+            
+            # Load preprocessing metadata (optional)
+            preprocessing_meta = {}
+            if args.preprocessing_metadata and os.path.exists(args.preprocessing_metadata):
+                with open(args.preprocessing_metadata, 'r') as f:
+                    preprocessing_meta = json.load(f)
+                print(f"[INFO] Loaded preprocessing metadata")
+            
+            # Parse parameters
+            print("[STEP 2/8] Parsing model parameters...")
+            max_samples_parsed = parse_max_samples(args.max_samples, len(data))
+            contamination_parsed = parse_contamination(args.contamination)
+            
+            # Validate max_features
+            if args.max_features <= 0.0 or args.max_features > 1.0:
+                print(f"[WARNING] max_features {args.max_features} out of range, using 1.0")
+                max_features = 1.0
+            else:
+                max_features = args.max_features
+            
+            model_params = {
+                'n_estimators': args.n_estimators,
+                'max_samples': max_samples_parsed,
+                'contamination': contamination_parsed,
+                'max_features': max_features,
+                'bootstrap': bootstrap,
+                'n_jobs': args.n_jobs,
+                'random_state': args.random_state,
+                'verbose': args.verbose,
+                'warm_start': warm_start
+            }
+            
+            print(f"[INFO] Model parameters:")
+            for param, value in model_params.items():
+                print(f"  - {param}: {value}")
+            
+            # Convert to numpy array
+            print("[STEP 3/8] Converting data to numpy array...")
+            X = data.values
+            feature_names = list(data.columns)
+            print(f"[INFO] Feature matrix shape: {X.shape}")
+            
+            # Initialize Isolation Forest
+            print("[STEP 4/8] Initializing Isolation Forest...")
+            model = IsolationForest(**model_params)
+            print(f"[INFO] Model initialized successfully")
+            
+            # Train model
+            print("[STEP 5/8] Training Isolation Forest...")
+            print(f"[INFO] This may take a few moments...")
+            
+            import time
+            start_time = time.time()
+            model.fit(X)
+            training_time = time.time() - start_time
+            
+            print(f"[INFO] Training completed in {training_time:.2f} seconds")
+            
+            # Calculate anomaly scores and predictions
+            print("[STEP 6/8] Calculating anomaly scores...")
+            anomaly_scores = model.decision_function(X)
+            predictions = model.predict(X)
+            
+            # Create output dataframe with scores
+            results_df = data.copy()
+            results_df['anomaly_score'] = anomaly_scores
+            results_df['prediction'] = predictions
+            results_df['is_anomaly'] = (predictions == -1).astype(int)
+            
+            # Calculate statistics
+            print("[STEP 7/8] Calculating statistics...")
+            stats = calculate_anomaly_statistics(anomaly_scores, predictions)
+            
+            print(f"[INFO] Anomaly Detection Results:")
+            print(f"  - Total samples: {stats['total_samples']}")
+            print(f"  - Normal samples: {stats['normal_count']} ({100 - stats['anomaly_percentage']:.2f}%)")
+            print(f"  - Anomalies detected: {stats['anomaly_count']} ({stats['anomaly_percentage']:.2f}%)")
+            print(f"  - Score range: [{stats['score_min']:.4f}, {stats['score_max']:.4f}]")
+            print(f"  - Score mean: {stats['score_mean']:.4f}")
+            
+            # Feature importance proxy (optional, may be slow for large feature sets)
+            feature_importances = {}
+            if len(feature_names) <= 100:  # Only calculate for reasonable number of features
+                try:
+                    feature_importances = get_feature_importance_proxy(model, feature_names, X)
+                    print(f"[INFO] Top 5 most important features:")
+                    for i, (feat, imp) in enumerate(list(feature_importances.items())[:5]):
+                        print(f"  {i+1}. {feat}: {imp:.6f}")
+                except Exception as e:
+                    print(f"[WARNING] Could not calculate feature importance: {e}")
+            else:
+                print(f"[INFO] Skipping feature importance calculation (too many features: {len(feature_names)})")
+            
+            # Save outputs
+            print("[STEP 8/8] Saving outputs...")
+            ensure_dir_for(args.trained_model)
+            ensure_dir_for(args.training_metadata)
+            ensure_dir_for(args.anomaly_scores)
+            
+            # Save model
+            with gzip.open(args.trained_model, 'wb') as f:
+                cloudpickle.dump(model, f)
+            print(f"[INFO] Saved model to: {args.trained_model}")
+            
+            # Save results with scores
+            results_df.to_parquet(args.anomaly_scores, index=False)
+            print(f"[INFO] Saved anomaly scores to: {args.anomaly_scores}")
+            
+            # Create comprehensive metadata
+            metadata = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'version': '1.0',
+                'model_type': 'IsolationForest',
+                'sklearn_version': '1.3+',
+                'training_time_seconds': float(training_time),
+                'model_parameters': {
+                    'n_estimators': args.n_estimators,
+                    'max_samples': str(max_samples_parsed),
+                    'contamination': str(contamination_parsed),
+                    'max_features': float(max_features),
+                    'bootstrap': bootstrap,
+                    'n_jobs': args.n_jobs,
+                    'random_state': args.random_state,
+                    'verbose': args.verbose,
+                    'warm_start': warm_start
+                },
+                'data_info': {
+                    'n_samples': int(data.shape[0]),
+                    'n_features': int(data.shape[1]),
+                    'feature_names': feature_names
+                },
+                'training_statistics': stats,
+                'feature_importance': feature_importances if feature_importances else None,
+                'anomaly_thresholds': {
+                    'decision_threshold': 0.0,
+                    'score_at_contamination': float(np.percentile(anomaly_scores, contamination_parsed * 100)) if isinstance(contamination_parsed, float) else None
+                },
+                'preprocessing_metadata': preprocessing_meta if preprocessing_meta else None
+            }
+            
+            with open(args.training_metadata, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"[INFO] Saved metadata to: {args.training_metadata}")
+            
+            print(f"{'='*80}")
+            print("BRICK 3 COMPLETE - TRAINING SUMMARY")
+            print(f"{'='*80}")
+            print(f"Model:                  Isolation Forest")
+            print(f"Training samples:       {data.shape[0]:,}")
+            print(f"Features used:          {data.shape[1]}")
+            print(f"Training time:          {training_time:.2f}s")
+            print(f"Trees in ensemble:      {args.n_estimators}")
+            print(f"Contamination:          {contamination_parsed}")
+            print(f"Max samples per tree:   {max_samples_parsed}")
+            print(f"")
+            print(f"ANOMALY DETECTION RESULTS:")
+            print(f"  Normal points:        {stats['normal_count']:,} ({100 - stats['anomaly_percentage']:.2f}%)")
+            print(f"  Anomalies:            {stats['anomaly_count']:,} ({stats['anomaly_percentage']:.2f}%)")
+            print(f"  Score range:          [{stats['score_min']:.4f}, {stats['score_max']:.4f}]")
+            print(f"  Anomaly score avg:    {stats['anomaly_score_mean']:.4f}" if stats['anomaly_score_mean'] else "  Anomaly score avg:    N/A")
+            print(f"  Normal score avg:     {stats['normal_score_mean']:.4f}" if stats['normal_score_mean'] else "  Normal score avg:     N/A")
+            print(f"{'='*80}")
+            print("SUCCESS: Isolation Forest trained and ready for inference!")
+            print(f"{'='*80}")
+            
+        except Exception as exc:
+            print("ERROR during training: " + str(exc), file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --preprocessed_data
+      - {inputPath: preprocessed_data}
+      - --preprocessing_metadata
+      - {inputPath: preprocessing_metadata}
+      - --n_estimators
+      - {inputValue: n_estimators}
+      - --max_samples
+      - {inputValue: max_samples}
+      - --contamination
+      - {inputValue: contamination}
+      - --max_features
+      - {inputValue: max_features}
+      - --bootstrap
+      - {inputValue: bootstrap}
+      - --n_jobs
+      - {inputValue: n_jobs}
+      - --random_state
+      - {inputValue: random_state}
+      - --verbose
+      - {inputValue: verbose}
+      - --warm_start
+      - {inputValue: warm_start}
+      - --trained_model
+      - {outputPath: trained_model}
+      - --training_metadata
+      - {outputPath: training_metadata}
+      - --anomaly_scores
+      - {outputPath: ano
