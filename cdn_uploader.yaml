@@ -1,0 +1,151 @@
+name: Upload to CDN v6-preprocessed-only
+
+inputs:
+  - {name: preprocessed_data, type: Dataset, description: "Preprocessed dataset (Parquet expected)"}
+  - {name: preprocesss_metadata, type: Data, description: "Preprocessed metadata JSON"}
+  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
+  - {name: domain, type: String, description: "Upload service base domain"}
+  - {name: get_cdn, type: String, description: "Public CDN base domain"}
+
+outputs:
+  - {name: preprocessed_data_cdn_url, type: String}
+  - {name: preprocesss_metadata_cdn_url, type: String}
+  - {name: schema_json, type: String}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - sh
+      - -ec
+      - |
+        if ! command -v curl >/dev/null 2>&1; then
+          apt-get update >/dev/null && apt-get install -y curl >/dev/null
+        fi
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+        import time
+        import tempfile
+        import shutil
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+
+        parser.add_argument('--preprocessed_data', required=True)
+        parser.add_argument('--preprocesss_metadata', required=True)
+        parser.add_argument('--bearer_token', required=True)
+        parser.add_argument('--domain', required=True)
+        parser.add_argument('--get_cdn', required=True)
+
+        parser.add_argument('--preprocessed_data_cdn_url', required=True)
+        parser.add_argument('--preprocesss_metadata_cdn_url', required=True)
+        parser.add_argument('--schema_json', required=True)
+
+        args = parser.parse_args()
+
+        def encode_special_chars(text):
+            return (
+                text.replace("$", "%24")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
+                    .replace("{", "%7B")
+                    .replace("}", "%7D")
+            )
+
+        with open(args.bearer_token, "r") as f:
+            bearer_token = f.read().strip()
+
+        upload_url = (
+            f"{args.domain}"
+            "/mobius-content-service/v1.0/content/upload"
+            "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+        )
+
+        def parquet_to_csv(path):
+            df = pd.read_parquet(path)
+            tmp = tempfile.mkstemp(suffix=".csv")[1]
+            df.to_csv(tmp, index=False)
+            return tmp
+
+        def sanitize_file(file_path):
+            name = os.path.basename(file_path)
+            safe = encode_special_chars(name)
+            if name != safe:
+                temp_path = os.path.join(tempfile.gettempdir(), safe)
+                shutil.copy2(file_path, temp_path)
+                return temp_path, temp_path
+            return file_path, None
+
+        def upload(file_path, output_path):
+            safe_path, temp = sanitize_file(file_path)
+            try:
+                result = subprocess.run(
+                    [
+                        "curl",
+                        "--location", upload_url,
+                        "--header", f"Authorization: Bearer {bearer_token}",
+                        "--form", f"file=@{safe_path}",
+                        "--fail",
+                        "--show-error",
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+                response = json.loads(result.stdout.decode())
+                rel = response.get("cdnUrl")
+                if not rel:
+                    raise RuntimeError(f"cdnUrl missing: {response}")
+
+                full_url = f"{args.get_cdn}{encode_special_chars(rel)}"
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                with open(output_path, "w") as f:
+                    f.write(full_url)
+                return full_url
+            finally:
+                if temp and os.path.exists(temp):
+                    os.remove(temp)
+
+        csv_path = parquet_to_csv(args.preprocessed_data)
+
+        preprocessed_data_cdn = upload(csv_path, args.preprocessed_data_cdn_url)
+        preprocesss_metadata_cdn = upload(
+            args.preprocesss_metadata,
+            args.preprocesss_metadata_cdn_url,
+        )
+
+        schema = {
+            "timestamp": int(time.time()),
+            "preprocessed_data_cdn": preprocessed_data_cdn,
+            "preprocessor_metadata_cdn": preprocesss_metadata_cdn,
+        }
+
+        os.makedirs(os.path.dirname(args.schema_json), exist_ok=True)
+        with open(args.schema_json, "w") as f:
+            json.dump(schema, f, indent=2)
+
+    args:
+      - --preprocessed_data
+      - {inputPath: preprocessed_data}
+      - --preprocesss_metadata
+      - {inputPath: preprocesss_metadata}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --preprocessed_data_cdn_url
+      - {outputPath: preprocessed_data_cdn_url}
+      - --preprocesss_metadata_cdn_url
+      - {outputPath: preprocesss_metadata_cdn_url}
+      - --schema_json
+      - {outputPath: schema_json}
