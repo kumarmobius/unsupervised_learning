@@ -1,4 +1,4 @@
-name: Feature Preprocessing v4 - Anomaly Detection
+name: Feature Preprocessing v4.1 - Anomaly Detection
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
@@ -396,7 +396,7 @@ implementation:
                     
                     # Get or create scaler
                     if 'scaler_obj' not in self.col_config[c]:
-                        scaler = choose_scaler(scaling_strategy, df[c])
+                        scaler = scaler = choose_scaler(df[c])
                         if scaler is not None:
                             try:
                                 scaler.fit(df[[c]].fillna(0).values)
