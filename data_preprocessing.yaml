@@ -1,4 +1,4 @@
-name: Feature Preprocessing v3 - Anomaly Detection
+name: Feature Preprocessing v4 - Anomaly Detection
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
@@ -11,7 +11,6 @@ inputs:
   - {name: add_row_statistics, type: String, description: "true/false to add per-row statistical features (CRITICAL for anomaly detection)", optional: true, default: "true"}
   - {name: add_missingness_indicators, type: String, description: "true/false to add missing value indicators (CRITICAL for anomaly detection)", optional: true, default: "true"}
   - {name: add_rare_indicators, type: String, description: "true/false to add rare value indicators (CRITICAL for anomaly detection)", optional: true, default: "true"}
-  - {name: scaling_strategy, type: String, description: "robust | standard | minmax | none | auto", optional: true, default: "robust"}
 outputs:
   - {name: preprocessed_data, type: Dataset, description: "Preprocessed features ready for anomaly detection"}
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor cloudpickle"}
@@ -29,7 +28,7 @@ implementation:
         from itertools import combinations
         import pandas as pd, numpy as np
         from sklearn.impute import SimpleImputer, KNNImputer
-        from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer, OneHotEncoder, LabelEncoder
+        from sklearn.preprocessing import  RobustScaler, PowerTransformer, OneHotEncoder, LabelEncoder
         from sklearn.pipeline import Pipeline
         from sklearn.experimental import enable_iterative_imputer
         from sklearn.impute import IterativeImputer
@@ -65,31 +64,23 @@ implementation:
             freq_map = series.value_counts(normalize=True).to_dict()
             return series.map(lambda x: freq_map.get(x, 0.0)), freq_map
 
-        def choose_scaler(strategy='auto', sample_series=None):
-            if strategy == 'none':
-                return None
-            elif strategy == 'robust':
+        def choose_scaler(sample_series):
+            v = sample_series.dropna()
+            
+            # If no data or constant column, use RobustScaler
+            if v.empty or v.std(ddof=0) == 0:
                 return RobustScaler()
-            elif strategy == 'standard':
-                return StandardScaler()
-            elif strategy == 'minmax':
-                return MinMaxScaler()
-            elif strategy == 'auto' and sample_series is not None:
-                v = sample_series.dropna()
-                if v.empty or v.std(ddof=0) == 0:
-                    return StandardScaler()
-                
-                skew = abs(float(v.skew()))
-                kurt = abs(float(v.kurtosis())) if len(v) > 3 else 0.0
-                extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
-                
-                # For anomaly detection, prefer robust scaling
-                if extreme_frac > 0.01 or kurt > 10:
-                    return RobustScaler()
-                elif skew >= 1.0:
-                    return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', StandardScaler())])
-                else:
-                    return StandardScaler()
+            
+            skew = abs(float(v.skew()))
+            kurt = abs(float(v.kurtosis())) if len(v) > 3 else 0.0
+            extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
+            
+            # For anomaly detection: prefer robust scaling for outliers/heavy tails
+            if extreme_frac > 0.01 or kurt > 10:
+                return RobustScaler()
+            # Use PowerTransformer for skewed distributions
+            elif skew >= 1.0:
+                return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', RobustScaler())])
             else:
                 return RobustScaler()  # Default for anomaly detection
 
@@ -245,7 +236,6 @@ implementation:
                     else:
                         cfg['imputer'] = ('iterative', {'max_iter': 10, 'random_state': 42})
                     
-                    cfg['scaler_choice'] = config.get('scaling_strategy', 'robust')
                     self.col_config[c] = cfg
                 
                 # Configure categorical columns
@@ -397,16 +387,12 @@ implementation:
                 # STEP 3: NUMERIC SCALING
                 # ========================================
                 print("[INFO] Scaling numeric features...")
-                scaling_strategy = cfg_global.get('scaling_strategy', 'robust')
+                scaling_strategy = 'auto'
                 
                 for c in self.num_cols:
                     if c not in df.columns:
                         continue
                     
-                    # Skip scaling if strategy is 'none'
-                    if scaling_strategy == 'none':
-                        print(f"[INFO] Skipping scaling for '{c}' (strategy=none)")
-                        continue
                     
                     # Get or create scaler
                     if 'scaler_obj' not in self.col_config[c]:
@@ -579,7 +565,6 @@ implementation:
         parser.add_argument('--add_row_statistics', type=str, default="true")
         parser.add_argument('--add_missingness_indicators', type=str, default="true")
         parser.add_argument('--add_rare_indicators', type=str, default="true")
-        parser.add_argument('--scaling_strategy', type=str, default="robust")
         parser.add_argument('--preprocessed_data', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--preprocessing_metadata', type=str, required=True)
@@ -617,8 +602,7 @@ implementation:
                 'max_interaction_features': args.max_interaction_features,
                 'add_row_statistics': add_row_stats,
                 'add_missingness_indicators': add_miss_ind,
-                'add_rare_indicators': add_rare_ind,
-                'scaling_strategy': args.scaling_strategy
+                'add_rare_indicators': add_rare_ind
             }
             
             print(f"[INFO] Configuration:")
@@ -627,7 +611,6 @@ implementation:
             print(f"  - Row statistics: {add_row_stats} (CRITICAL for anomaly detection)")
             print(f"  - Missingness indicators: {add_miss_ind} (CRITICAL for anomaly detection)")
             print(f"  - Rare indicators: {add_rare_ind} (CRITICAL for anomaly detection)")
-            print(f"  - Scaling strategy: {args.scaling_strategy}")
             
             # Fit Preprocessor
             print("[STEP 2/7] Fitting preprocessor...")
@@ -750,7 +733,6 @@ implementation:
             print(f"Row statistics:             {len(preprocessor.row_stat_features)}")
             print(f"Interaction features:       {len(preprocessor.interaction_features)}")
             print(f"Final feature count:        {preprocessed.shape[1]}")
-            print(f"Scaling strategy:           {args.scaling_strategy}")
             print(f"Rare threshold:             {args.rare_threshold}")
             print(f"NaN count:                  {preprocessed.isna().sum().sum()}")
             print(f"Inf count:                  0")
@@ -785,8 +767,6 @@ implementation:
       - {inputValue: add_missingness_indicators}
       - --add_rare_indicators
       - {inputValue: add_rare_indicators}
-      - --scaling_strategy
-      - {inputValue: scaling_strategy}
       - --preprocessed_data
       - {outputPath: preprocessed_data}
       - --preprocessor
