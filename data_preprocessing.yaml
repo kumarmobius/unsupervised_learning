@@ -368,9 +368,6 @@ implementation:
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
                 
-                # ========================================
-                # STEP 1: ADD MISSINGNESS INDICATORS (CRITICAL FOR ANOMALY DETECTION)
-                # ========================================
                 if training_mode and cfg_global.get('add_missingness_indicators', True):
                     print("[INFO] Adding missingness indicator flags...")
                     missing_flag_cols = []
@@ -410,9 +407,6 @@ implementation:
                         # Fill any remaining nulls with median
                         df[c] = df[c].fillna(df[c].median())
                 
-                # ========================================
-                # STEP 3: NUMERIC SCALING
-                # ========================================
                 print("[INFO] Scaling numeric features...")
                 scaling_strategy = cfg_global.get('scaling_strategy', 'robust')
                 
@@ -445,18 +439,13 @@ implementation:
                             scaler.fit(df[[c]].fillna(0).values)
                             transformed = scaler.transform(df[[c]].fillna(0).values)
                             df[c] = transformed.reshape(-1)
-                
-                # ========================================
-                # STEP 4: ROW STATISTICS (CRITICAL FOR ANOMALY DETECTION)
-                # ========================================
+
                 if training_mode and cfg_global.get('add_row_statistics', True):
                     current_num_cols = [c for c in df.columns if c in self.num_cols]
                     df, row_stat_cols = add_row_statistics(df, current_num_cols)
                     self.row_stat_features = row_stat_cols
                 
-                # ========================================
-                # STEP 5: POLYNOMIAL INTERACTIONS (OPTIONAL - KEEP MINIMAL)
-                # ========================================
+
                 if training_mode and cfg_global.get('create_interactions', False):
                     print("[INFO] Creating minimal polynomial/interaction features...")
                     current_num_cols = [c for c in df.columns if c in self.num_cols]
@@ -470,9 +459,7 @@ implementation:
                         )
                         self.interaction_features = interaction_cols
                 
-                # ========================================
-                # STEP 6: CATEGORICAL ENCODING WITH RARE INDICATORS
-                # ========================================
+
                 print("[INFO] Encoding categorical features for Isolation Forest...")
                 cols_to_drop = []
                 add_rare_indicators = training_mode and cfg_global.get('add_rare_indicators', True)
@@ -545,18 +532,12 @@ implementation:
                 if cols_to_drop:
                     df = df.drop(columns=cols_to_drop)
                     print(f"[INFO] Dropped {len(cols_to_drop)} constant/empty columns")
-                
-                # ========================================
-                # STEP 7: FEATURE SELECTION (IMPORTANT FOR ISOLATION FOREST)
-                # ========================================
+
                 if training_mode:
                     max_features = cfg_global.get('max_features_for_isolation', 100)
                     df, selected_cols = select_top_features_by_variance(df, max_features)
                     self.selected_features = selected_cols
                 
-                # ========================================
-                # STEP 8: FINAL CLEANUP
-                # ========================================
                 print("[INFO] Final cleanup and validation...")
                 
                 # Convert any remaining object columns
