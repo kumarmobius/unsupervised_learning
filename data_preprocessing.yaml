@@ -1,4 +1,4 @@
-name: Feature Preprocessing v6.2 - Optimized for Isolation Forest
+name: Feature Preprocessing v6.3- Optimized for Isolation Forest
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
@@ -683,8 +683,35 @@ implementation:
             
             # Verify no NaNs or Infs remain
             print("[STEP 5/7] Final validation...")
+            
+            # Count NaNs
             nan_count = preprocessed.isna().sum().sum()
-            inf_count = np.isinf(preprocessed.select_dtypes(include=[np.number]).values).sum()
+            
+            # Safely check for infinite values - only on numeric columns
+            numeric_cols = preprocessed.select_dtypes(include=[np.number])
+            if not numeric_cols.empty:
+                try:
+                    # Convert to float64 to ensure compatibility
+                    numeric_values = numeric_cols.values.astype(np.float64)
+                    inf_count = np.isinf(numeric_values).sum()
+                except Exception as e:
+                    print(f"[WARNING] Could not check for infinite values: {e}")
+                    inf_count = 0
+            else:
+                inf_count = 0
+            
+            if nan_count > 0:
+                print(f"[WARNING] {nan_count} NaN values remain - filling with 0")
+                preprocessed = preprocessed.fillna(0)
+            
+            if inf_count > 0:
+                print(f"[WARNING] {inf_count} Inf values remain - replacing with 0")
+                # Only replace infs in numeric columns
+                for col in numeric_cols.columns:
+                    try:
+                        preprocessed[col] = preprocessed[col].replace([np.inf, -np.inf], 0)
+                    except Exception:
+                        pass
             
             if nan_count > 0:
                 print(f"[WARNING] {nan_count} NaN values remain - filling with 0")
