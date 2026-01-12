@@ -2,8 +2,8 @@ name: Data loader v2-unsupervised
 inputs:
   - {name: api_url, type: String, description: 'API URL to fetch JSON dataset'}
   - {name: access_token, type: string, description: 'Bearer access token for API auth'}
-  - {name: sample_fraction, type: Float, default: "1.0", description: 'Optional fraction to randomly sample the fetched data (0.0 < f <= 1.0)'}
-  - {name: page_size, type: Integer, default: "2000", description: 'Number of records per page (if server allows override)'}
+  - {name: exclude_column, type: String, description: 'Comma-separated list of columns to exclude from the dataset', default: ''}
+  - {name: use_column, type: String, description: 'Comma-separated list of columns to include in the dataset (all other columns will be excluded)', default: ''}
 outputs:
   - {name: data, type: Dataset}
 
@@ -27,8 +27,8 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument('--api_url', type=str, required=True)
         parser.add_argument('--access_token', type=str, required=True)
-        parser.add_argument('--sample_fraction', type=float, default=1.0)
-        parser.add_argument('--page_size', type=int, default=2000)
+        parser.add_argument('--exclude_column', type=str, default='')
+        parser.add_argument('--use_column', type=str, default='')
         parser.add_argument('--output_data', type=str, required=True)
         args = parser.parse_args()
 
@@ -100,6 +100,15 @@ implementation:
                 
             return page_size, total_pages, total_instances
 
+        def parse_column_list(column_string):
+            if not column_string or column_string.strip() == '':
+                return []
+            
+            # Split by comma, strip whitespace, and filter out empty strings
+            columns = [col.strip() for col in column_string.split(',')]
+            columns = [col for col in columns if col]
+            return columns
+
         # === STEP 1: METADATA DISCOVERY ===
         logger.info("="*80)
         logger.info("STEP 1: METADATA DISCOVERY")
@@ -109,7 +118,7 @@ implementation:
         separator = '&' if '?' in base_url else '?'
         
         # Request first page with metadata flag
-        initial_size = args.page_size
+        initial_size = 2000  # Fixed page size
         meta_url = f"{base_url}{separator}page=0&size={initial_size}&showPageableMetaData=true"
         
         logger.info(f"Requesting metadata from: {meta_url}")
@@ -223,19 +232,56 @@ implementation:
         logger.info("")
         logger.info("STEP 3: Creating DataFrame...")
         df = pd.DataFrame(all_records)
-        logger.info(f"  DataFrame shape: {df.shape}")
-        logger.info(f"  Columns: {list(df.columns)}")
+        logger.info(f"  Original DataFrame shape: {df.shape}")
+        logger.info(f"  Original columns: {list(df.columns)}")
 
-        # === STEP 4: OPTIONAL SAMPLING ===
-        if not (0.0 < args.sample_fraction <= 1.0):
-            raise ValueError("sample_fraction must be in (0.0, 1.0].")
+        # === STEP 4: COLUMN FILTERING ===
+        logger.info("")
+        logger.info("STEP 4: Applying column filtering...")
         
-        if args.sample_fraction < 1.0:
-            logger.info("")
-            logger.info(f"STEP 4: Sampling {args.sample_fraction*100:.1f}% of data...")
-            original_size = len(df)
-            df = df.sample(frac=args.sample_fraction, random_state=42).reset_index(drop=True)
-            logger.info(f"  Sampled: {original_size} → {len(df)} rows")
+        # Parse column lists
+        exclude_columns = parse_column_list(args.exclude_column)
+        use_columns = parse_column_list(args.use_column)
+        
+        logger.info(f"  Columns to exclude: {exclude_columns if exclude_columns else 'None'}")
+        logger.info(f"  Columns to use: {use_columns if use_columns else 'All columns (excluding excluded ones)'}")
+        
+        # Validate column lists
+        if exclude_columns and use_columns:
+            raise ValueError("Cannot specify both 'exclude_column' and 'use_column' parameters. Use only one.")
+        
+        if exclude_columns:
+            # Check if all columns to exclude exist in the dataframe
+            missing_exclude = [col for col in exclude_columns if col not in df.columns]
+            if missing_exclude:
+                logger.warning(f"  ⚠ Columns not found for exclusion: {missing_exclude}")
+            
+            # Filter out excluded columns
+            columns_to_keep = [col for col in df.columns if col not in exclude_columns]
+            if not columns_to_keep:
+                raise ValueError("All columns would be excluded. Please adjust your exclude_column parameter.")
+            
+            df = df[columns_to_keep]
+            logger.info(f"  ✓ Excluded {len(exclude_columns)} columns")
+            logger.info(f"  Remaining columns: {list(df.columns)}")
+            
+        elif use_columns:
+            # Check if all specified use columns exist
+            missing_use = [col for col in use_columns if col not in df.columns]
+            if missing_use:
+                logger.warning(f"  ⚠ Columns not found for inclusion: {missing_use}")
+                # Remove missing columns from the list
+                use_columns = [col for col in use_columns if col in df.columns]
+            
+            if not use_columns:
+                raise ValueError("None of the specified 'use_column' values exist in the dataset.")
+            
+            df = df[use_columns]
+            logger.info(f"  ✓ Selected {len(use_columns)} columns")
+            logger.info(f"  Selected columns: {list(df.columns)}")
+        
+        else:
+            logger.info("  ✓ No column filtering applied, keeping all columns")
 
         # === STEP 5: SAVE OUTPUT ===
         logger.info("")
@@ -259,6 +305,7 @@ implementation:
         logger.info("="*80)
         logger.info(f"Total records fetched: {len(all_records)}")
         logger.info(f"Final dataset shape: {df.shape}")
+        logger.info(f"Columns in final dataset: {list(df.columns)}")
         logger.info(f"Memory usage: {df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB")
         logger.info("")
         logger.info("First 3 rows:")
@@ -271,9 +318,9 @@ implementation:
       - {inputValue: api_url}
       - --access_token
       - {inputPath: access_token}
-      - --sample_fraction
-      - {inputValue: sample_fraction}
-      - --page_size
-      - {inputValue: page_size}
+      - --exclude_column
+      - {inputValue: exclude_column}
+      - --use_column
+      - {inputValue: use_column}
       - --output_data
       - {outputPath: data}
