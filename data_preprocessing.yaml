@@ -1,19 +1,16 @@
-name: Feature Preprocessing v6.3- Optimized for Isolation Forest
+name: Feature Preprocessing v4.1 - Anomaly Detection
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
-  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer (use 0 to disable for anomaly detection)", optional: true, default: "0"}
-  - {name: rare_threshold, type: Float, description: "Rare label threshold for anomaly detection", optional: true, default: "0.0005"}
+  - {name: max_knn_rows, type: Integer, description: "Max rows for KNN imputer", optional: true, default: "5000"}
+  - {name: rare_threshold, type: Float, description: "Rare label threshold (use 0.0001 for anomaly detection)", optional: true, default: "0.005"}
   - {name: enable_string_similarity, type: String, description: "true/false for high-cardinality grouping (use false for anomaly detection)", optional: true, default: "false"}
-  - {name: create_interactions, type: String, description: "true/false to create polynomial interactions (use false for anomaly detection)", optional: true, default: "false"}
+  - {name: create_interactions, type: String, description: "true/false to create polynomial interactions", optional: true, default: "false"}
   - {name: interaction_degree, type: Integer, description: "Polynomial degree for interactions", optional: true, default: "2"}
-  - {name: max_interaction_features, type: Integer, description: "Max interaction features to create", optional: true, default: "10"}
+  - {name: max_interaction_features, type: Integer, description: "Max interaction features to create", optional: true, default: "15"}
   - {name: add_row_statistics, type: String, description: "true/false to add per-row statistical features (CRITICAL for anomaly detection)", optional: true, default: "true"}
   - {name: add_missingness_indicators, type: String, description: "true/false to add missing value indicators (CRITICAL for anomaly detection)", optional: true, default: "true"}
   - {name: add_rare_indicators, type: String, description: "true/false to add rare value indicators (CRITICAL for anomaly detection)", optional: true, default: "true"}
-  - {name: use_median_imputation, type: String, description: "true/false to use median imputation instead of KNN (RECOMMENDED for anomaly detection)", optional: true, default: "true"}
-  - {name: scaling_strategy, type: String, description: "robust/standard/none - scaling strategy for Isolation Forest", optional: true, default: "robust"}
-  - {name: max_features_for_isolation, type: Integer, description: "Max features to keep (Isolation Forest works better with fewer features)", optional: true, default: "100"}
 outputs:
   - {name: preprocessed_data, type: Dataset, description: "Preprocessed features ready for anomaly detection"}
   - {name: preprocessor, type: Data, description: "Fitted Preprocessor cloudpickle"}
@@ -30,10 +27,12 @@ implementation:
         from datetime import datetime
         from itertools import combinations
         import pandas as pd, numpy as np
-        from sklearn.impute import SimpleImputer
-        from sklearn.preprocessing import RobustScaler, StandardScaler, PowerTransformer, OneHotEncoder
+        from sklearn.impute import SimpleImputer, KNNImputer
+        from sklearn.preprocessing import  RobustScaler, PowerTransformer, OneHotEncoder, LabelEncoder
         from sklearn.pipeline import Pipeline
-        from sklearn.feature_selection import VarianceThreshold
+        from sklearn.experimental import enable_iterative_imputer
+        from sklearn.impute import IterativeImputer
+        from rapidfuzz import process as rf_process, fuzz as rf_fuzz
         from scipy import stats
         import cloudpickle
         
@@ -45,103 +44,108 @@ implementation:
             if d and not os.path.exists(d):
                 os.makedirs(d, exist_ok=True)
 
-        def collapse_rare_labels(series, threshold_frac=0.005):
+        def collapse_rare_labels(series, threshold_frac=0.01):
             counts=series.value_counts(dropna=False)
             n=len(series)
             rare = set(counts[counts <= max(1,int(threshold_frac*n))].index)
             return series.map(lambda x: "__RARE__" if x in rare else x), rare
 
+        def string_similarity_group(series, score_threshold=90):
+            vals=[v for v in pd.Series(series.dropna().unique()).astype(str)]
+            mapping={}; used=set()
+            for v in vals:
+                if v in used: continue
+                matches=rf_process.extract(v, vals, scorer=rf_fuzz.token_sort_ratio, score_cutoff=score_threshold)
+                group=[m[0] for m in matches]
+                for g in group: mapping[g]=v; used.add(g)
+            return pd.Series(series).astype(object).map(lambda x: mapping.get(str(x), x)), mapping
+
         def frequency_encoding(series):
             freq_map = series.value_counts(normalize=True).to_dict()
             return series.map(lambda x: freq_map.get(x, 0.0)), freq_map
 
-        def choose_scaler(sample_series, strategy='robust'):
+        def choose_scaler(sample_series):
             v = sample_series.dropna()
             
+            # If no data or constant column, use RobustScaler
             if v.empty or v.std(ddof=0) == 0:
-                if strategy == 'robust':
-                    return RobustScaler()
-                elif strategy == 'standard':
-                    return StandardScaler()
-                else:
-                    return None
-            
-            if strategy == 'none':
-                return None
-            elif strategy == 'robust':
                 return RobustScaler()
-            elif strategy == 'standard':
-                return StandardScaler()
-            elif strategy == 'auto':
-                skew = abs(float(v.skew()))
-                extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
-                
-                if skew >= 2.0 or extreme_frac > 0.05:
-                    return RobustScaler()
-                else:
-                    return StandardScaler()
+            
+            skew = abs(float(v.skew()))
+            kurt = abs(float(v.kurtosis())) if len(v) > 3 else 0.0
+            extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
+            
+            # For anomaly detection: prefer robust scaling for outliers/heavy tails
+            if extreme_frac > 0.01 or kurt > 10:
+                return RobustScaler()
+            # Use PowerTransformer for skewed distributions
+            elif skew >= 1.0:
+                return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', RobustScaler())])
             else:
                 return RobustScaler()  # Default for anomaly detection
 
-        def choose_categorical_encoder(col, series, n_rows, model_type='anomaly_detection'):
+        def choose_categorical_encoder(col, series, n_rows):
             nunique = series.nunique(dropna=True)
             
             if nunique == 0:
                 return 'drop', None
             elif nunique == 1:
                 return 'drop', None
-            
-            # FOR ANOMALY DETECTION WITH ISOLATION FOREST:
-            # Frequency encoding is ideal because:
-            # 1. Creates a single numerical feature (reduces dimensionality)
-            # 2. Rare categories get low frequency values (easy to isolate)
-            # 3. Preserves the "rareness" signal for anomaly detection
-            
-            elif nunique <= 5:
-                # For very low cardinality, one-hot might work
-                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop=None)
+            elif nunique == 2:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            elif nunique <= 10:
+                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            elif nunique <= 50:
+                return 'frequency', None
             else:
-                # Use frequency encoding for everything else
-                # This is optimal for Isolation Forest
+                # High cardinality - use frequency encoding
                 return 'frequency', None
 
-        def add_polynomial_features(df, numeric_cols, degree=2, interaction_only=True, max_features=10):
-            if len(numeric_cols) < 2 or max_features == 0:
+        def add_polynomial_features(df, numeric_cols, degree=2, interaction_only=True, max_features=20):
+            if len(numeric_cols) < 2:
+                print("[INFO] Not enough numeric columns for interactions (need ≥2)")
                 return df, []
             
             print(f"[INFO] Creating polynomial features (degree={degree}, max={max_features})")
             
             # Select top columns by variance
             variances = df[numeric_cols].var().sort_values(ascending=False)
-            top_cols = variances.head(min(4, len(numeric_cols))).index.tolist()
+            top_cols = variances.head(min(5, len(numeric_cols))).index.tolist()
             
             new_features = {}
             new_feature_names = []
             interaction_count = 0
             
-            # Create only 2-way interactions (Isolation Forest struggles with higher-order)
+            # Create interactions
             for col1, col2 in combinations(top_cols, 2):
                 if interaction_count >= max_features:
                     break
                 
-                # Multiplication interaction
-                if pd.api.types.is_numeric_dtype(df[col1]) and pd.api.types.is_numeric_dtype(df[col2]):
-                    interaction_name = f"{col1}_x_{col2}"
-                    new_features[interaction_name] = df[col1] * df[col2]
-                    new_feature_names.append(interaction_name)
+                # Multiplication
+                interaction_name = f"{col1}_x_{col2}"
+                new_features[interaction_name] = df[col1] * df[col2]
+                new_feature_names.append(interaction_name)
+                interaction_count += 1
+                
+                # Division (if denominator never zero)
+                if (df[col2] != 0).all():
+                    div_name = f"{col1}_div_{col2}"
+                    new_features[div_name] = df[col1] / (df[col2] + 1e-10)
+                    new_feature_names.append(div_name)
                     interaction_count += 1
+                    
+                if interaction_count >= max_features:
+                    break
             
-            # Add squared terms (only for highly skewed features)
+            # Add squared terms
             if degree >= 2 and interaction_count < max_features:
-                for col in top_cols[:2]:
+                for col in top_cols[:3]:
                     if interaction_count >= max_features:
                         break
-                    skewness = abs(float(df[col].skew()))
-                    if skewness > 1.0:  # Only square if skewed
-                        sq_name = f"{col}_squared"
-                        new_features[sq_name] = df[col] ** 2
-                        new_feature_names.append(sq_name)
-                        interaction_count += 1
+                    sq_name = f"{col}_squared"
+                    new_features[sq_name] = df[col] ** 2
+                    new_feature_names.append(sq_name)
+                    interaction_count += 1
             
             # Add to dataframe
             for name, values in new_features.items():
@@ -157,62 +161,23 @@ implementation:
                 print("[WARNING] No numeric columns for row statistics")
                 return df, []
             
-            num_data = df[numeric_cols].values.astype(float)  # Ensure float type
+            num_data = df[numeric_cols].values
             new_features = {}
             feature_names = []
             
-            # Basic row statistics that Isolation Forest can easily split on
-            # Handle NaN values safely
+            # Row statistics
             new_features['row_mean'] = np.nanmean(num_data, axis=1)
-            
-            # Safe standard deviation calculation
-            try:
-                # Calculate variance safely
-                row_var = np.nanvar(num_data, axis=1, ddof=0)
-                # Replace any negative or NaN values with 0
-                row_var = np.where(np.isnan(row_var) | (row_var < 0), 0, row_var)
-                # Calculate std
-                new_features['row_std'] = np.sqrt(row_var)
-            except Exception as e:
-                print(f"[WARNING] Row std calculation failed: {e}, using zeros")
-                new_features['row_std'] = np.zeros(len(df))
-            
+            new_features['row_std'] = np.nanstd(num_data, axis=1)
+            new_features['row_median'] = np.nanmedian(num_data, axis=1)
             new_features['row_min'] = np.nanmin(num_data, axis=1)
             new_features['row_max'] = np.nanmax(num_data, axis=1)
             new_features['row_range'] = new_features['row_max'] - new_features['row_min']
+            new_features['row_skew'] = stats.skew(num_data, axis=1, nan_policy='omit')
+            new_features['row_kurtosis'] = stats.kurtosis(num_data, axis=1, nan_policy='omit')
             
-            # Row anomalies - z-score based
-            row_means = new_features['row_mean']
-            row_stds = new_features['row_std']
-            try:
-                std_of_stds = np.nanstd(row_stds)
-                if std_of_stds < 1e-10:
-                    z_scores = np.zeros_like(row_means)
-                else:
-                    z_scores = (row_means - np.nanmean(row_means)) / std_of_stds
-                new_features['row_z_score'] = np.nan_to_num(z_scores, nan=0.0)
-            except Exception as e:
-                print(f"[WARNING] Row z-score calculation failed: {e}, using zeros")
-                new_features['row_z_score'] = np.zeros(len(df))
-            
-            # Missing value patterns - CRITICAL for anomaly detection
+            # Missing value pattern (CRITICAL for anomaly detection)
             new_features['row_null_count'] = np.isnan(num_data).sum(axis=1)
             new_features['row_null_fraction'] = new_features['row_null_count'] / len(numeric_cols)
-            
-            # Outlier count per row
-            if len(numeric_cols) > 2:
-                try:
-                    medians = np.nanmedian(num_data, axis=0)
-                    mads = np.nanmedian(np.abs(num_data - medians), axis=0)
-                    # Handle zero MADs
-                    mads = np.where(mads < 1e-10, 1.0, mads)  # Replace zeros with 1.0
-                    outlier_mask = np.abs(num_data - medians) > (3 * mads)
-                    new_features['row_outlier_count'] = np.sum(outlier_mask, axis=1)
-                    new_features['row_outlier_fraction'] = new_features['row_outlier_count'] / len(numeric_cols)
-                except Exception as e:
-                    print(f"[WARNING] Outlier calculation failed: {e}, using zeros")
-                    new_features['row_outlier_count'] = np.zeros(len(df))
-                    new_features['row_outlier_fraction'] = np.zeros(len(df))
             
             feature_names = list(new_features.keys())
             
@@ -222,37 +187,8 @@ implementation:
             print(f"[INFO] Added {len(new_features)} row-level features")
             return df, feature_names
 
-        def select_top_features_by_variance(df, max_features=100):
-            if len(df.columns) <= max_features:
-                return df, list(df.columns)
-            
-            print(f"[INFO] Selecting top {max_features} features by variance...")
-            
-            # Calculate variance for numeric columns
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            if len(numeric_cols) == 0:
-                return df, list(df.columns)
-            
-            variances = df[numeric_cols].var().sort_values(ascending=False)
-            
-            # Always keep row statistics and missing indicators
-            special_cols = [col for col in df.columns if any(prefix in col for prefix in 
-                           ['row_', '_missing', '_is_rare', '_x_', '_squared'])]
-            
-            # Select top features
-            top_numeric = variances.head(max_features - len(special_cols)).index.tolist()
-            selected_cols = list(set(top_numeric + special_cols))
-            
-            # Make sure we don't exceed max_features
-            if len(selected_cols) > max_features:
-                selected_cols = selected_cols[:max_features]
-            
-            selected_df = df[selected_cols]
-            print(f"[INFO] Selected {len(selected_cols)} features out of {len(df.columns)}")
-            return selected_df, selected_cols
-
-        # Preprocessor Class for Isolation Forest Anomaly Detection
-        class IsolationForestPreprocessor:
+        # Preprocessor Class for Anomaly Detection
+        class AnomalyDetectionPreprocessor:
             def __init__(self):
                 self.num_cols = []
                 self.cat_cols = []
@@ -263,8 +199,7 @@ implementation:
                 self.row_stat_features = []
                 self.missingness_indicators = []
                 self.rare_indicators = []
-                self.selected_features = []
-            
+
             def fit(self, df, config=None):
                 self.global_metadata['config'] = config or {}
                 nrows = len(df)
@@ -287,21 +222,19 @@ implementation:
                     cfg['mean'] = float(s.mean()) if not s.isna().all() else 0.0
                     cfg['std'] = float(s.std()) if not s.isna().all() else 0.0
                     cfg['skew'] = float(s.dropna().skew()) if len(s.dropna()) > 2 else 0.0
+                    cfg['kurtosis'] = float(s.dropna().kurtosis()) if len(s.dropna()) > 3 else 0.0
                     
-                    # For Isolation Forest: Always use median imputation (not KNN!)
-                    # KNN would hide anomalies by imputing with similar rows
+                    # Choose imputation strategy
                     if missing_frac == 0:
                         cfg['imputer'] = ('none', None)
+                    elif missing_frac < 0.02:
+                        imp = SimpleImputer(strategy='median')
+                        imp.fit(np.array(s).reshape(-1, 1))
+                        cfg['imputer'] = ('simple_median', imp)
+                    elif missing_frac < 0.25 and nrows <= config.get('max_knn_rows', 5000):
+                        cfg['imputer'] = ('knn', {'n_neighbors': 5})
                     else:
-                        # Use median for all missing values
-                        med_val = s.median()
-                        cfg['median_value'] = float(med_val) if not np.isnan(med_val) else 0.0
-                        cfg['imputer'] = ('median', None)
-                    
-                    # Choose scaler based on strategy
-                    scaling_strategy = config.get('scaling_strategy', 'robust')
-                    cfg['scaling_strategy'] = scaling_strategy
-                    cfg['scaler_obj'] = None  # Will be fitted in transform
+                        cfg['imputer'] = ('iterative', {'max_iter': 10, 'random_state': 42})
                     
                     self.col_config[c] = cfg
                 
@@ -312,19 +245,13 @@ implementation:
                     
                     cfg['n_unique'] = int(s.nunique(dropna=True))
                     cfg['missing_frac'] = float(s.isna().mean())
-                    cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.0005)
+                    cfg['high_card'] = cfg['n_unique'] > max(50, 0.05 * nrows)
+                    cfg['rare_threshold_frac'] = config.get('rare_threshold', 0.0001)
                     
-                    # Choose encoding strategy optimized for Isolation Forest
-                    enc_name, enc_obj = choose_categorical_encoder(c, s, nrows, model_type='isolation_forest')
+                    # Choose encoding strategy
+                    enc_name, enc_obj = choose_categorical_encoder(c, s, nrows)
                     cfg['encoder_type'] = enc_name
                     cfg['encoder_obj'] = enc_obj
-                    
-                    # Store most common value for imputation
-                    if not s.isna().all():
-                        mode_vals = s.mode()
-                        cfg['mode_value'] = str(mode_vals.iloc[0]) if not mode_vals.empty else '__MISSING__'
-                    else:
-                        cfg['mode_value'] = '__MISSING__'
                     
                     self.col_config[c] = cfg
                 
@@ -353,23 +280,26 @@ implementation:
                 self.global_metadata['cat_cols'] = self.cat_cols
                 
                 return self
-            
+
             def transform(self, df, training_mode=False):
                 df = df.copy()
                 cfg_global = self.global_metadata.get('config', {})
                 
-                print("[INFO] Starting transformation for Isolation Forest...")
+                print("[INFO] Starting transformation...")
                 
                 # Clean inf/nan strings
-                df.replace(["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf", ""], 
+                df.replace(["NaN", "nan", "None", "null", "INF", "-INF", "Inf", "-Inf", "inf", "-inf"], 
                           np.nan, inplace=True)
                 
                 for c in self.num_cols:
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce')
                 
+                # ========================================
+                # STEP 1: ADD MISSINGNESS INDICATORS (CRITICAL FOR ANOMALY DETECTION)
+                # ========================================
                 if training_mode and cfg_global.get('add_missingness_indicators', True):
-                    print("[INFO] Adding missingness indicator flags...")
+                    print("[INFO] Adding missingness indicator flags (anomaly detection feature)...")
                     missing_flag_cols = []
                     
                     # Numeric missing indicators
@@ -391,32 +321,82 @@ implementation:
                         print(f"[INFO] Added {len(missing_flag_cols)} missingness indicators")
                 
                 # ========================================
-                # STEP 2: NUMERIC IMPUTATION (MEDIAN ONLY - NO KNN!)
+                # STEP 2: NUMERIC IMPUTATION
                 # ========================================
-                print("[INFO] Imputing missing values with median (KNN disabled for anomaly detection)...")
+                print("[INFO] Imputing missing values...")
+                
+                # Prepare temporary df with median-filled values for KNN/Iterative
+                temp_df = df.copy()
+                for c in self.num_cols:
+                    if c not in temp_df.columns:
+                        continue
+                    imputer_info = self.col_config.get(c, {}).get('imputer', ('none', None))
+                    if imputer_info[0] in ('knn', 'iterative'):
+                        med = pd.to_numeric(temp_df[c], errors='coerce').median()
+                        temp_df[c] = temp_df[c].fillna(med if not np.isnan(med) else 0)
+                
+                # KNN imputation
+                need_knn = [c for c in self.num_cols if c in df.columns and 
+                           self.col_config.get(c, {}).get('imputer', ('none', None))[0] == 'knn']
+                
+                if need_knn:
+                    print(f"[INFO] KNN imputation on {len(need_knn)} columns...")
+                    try:
+                        knn = KNNImputer(n_neighbors=5)
+                        imputed = knn.fit_transform(temp_df[need_knn])
+                        df[need_knn] = pd.DataFrame(imputed, columns=need_knn, index=df.index)
+                    except Exception as e:
+                        print(f"[WARNING] KNN imputation failed: {e}, falling back to median")
+                        for c in need_knn:
+                            df[c] = df[c].fillna(df[c].median())
+                
+                # Iterative imputation
+                need_iter = [c for c in self.num_cols if c in df.columns and 
+                            self.col_config.get(c, {}).get('imputer', ('none', None))[0] == 'iterative']
+                
+                if need_iter:
+                    print(f"[INFO] Iterative imputation on {len(need_iter)} columns...")
+                    try:
+                        iter_imp = IterativeImputer(max_iter=10, random_state=42)
+                        arr = df[need_iter].astype(float).replace([np.inf, -np.inf], np.nan).values
+                        iter_out = iter_imp.fit_transform(arr)
+                        df[need_iter] = pd.DataFrame(iter_out, columns=need_iter, index=df.index)
+                    except Exception as e:
+                        print(f"[WARNING] Iterative imputation failed: {e}, falling back to median")
+                        for c in need_iter:
+                            df[c] = df[c].fillna(df[c].median())
+                
+                # Simple median imputation
+                for c in self.num_cols:
+                    if c not in df.columns:
+                        continue
+                    cfg = self.col_config.get(c, {})
+                    if cfg.get('imputer', ('none', None))[0] == 'simple_median':
+                        imp = cfg['imputer'][1]
+                        try:
+                            df[c] = imp.transform(df[[c]])
+                        except Exception:
+                            df[c] = df[c].fillna(df[c].median())
+                
+                # Fill any remaining nulls in numeric columns
+                for c in self.num_cols:
+                    if c in df.columns and df[c].isna().any():
+                        df[c] = df[c].fillna(df[c].median())
+                
+                # ========================================
+                # STEP 3: NUMERIC SCALING
+                # ========================================
+                print("[INFO] Scaling numeric features...")
+                scaling_strategy = 'auto'
                 
                 for c in self.num_cols:
                     if c not in df.columns:
                         continue
                     
-                    cfg = self.col_config.get(c, {})
-                    if cfg.get('imputer', ('none', None))[0] == 'median':
-                        med_val = cfg.get('median_value', df[c].median())
-                        df[c] = df[c].fillna(med_val)
-                    elif df[c].isna().any():
-                        # Fill any remaining nulls with median
-                        df[c] = df[c].fillna(df[c].median())
-                
-                print("[INFO] Scaling numeric features...")
-                scaling_strategy = cfg_global.get('scaling_strategy', 'robust')
-                
-                for c in self.num_cols:
-                    if c not in df.columns:
-                        continue
                     
                     # Get or create scaler
                     if 'scaler_obj' not in self.col_config[c]:
-                        scaler = choose_scaler(df[c], strategy=scaling_strategy)
+                        scaler = scaler = choose_scaler(df[c])
                         if scaler is not None:
                             try:
                                 scaler.fit(df[[c]].fillna(0).values)
@@ -434,20 +414,21 @@ implementation:
                             df[c] = transformed.reshape(-1)
                         except Exception as e:
                             print(f"[WARNING] Scaling failed for '{c}': {e}")
-                            # If scaling fails, use RobustScaler
-                            scaler = RobustScaler()
-                            scaler.fit(df[[c]].fillna(0).values)
-                            transformed = scaler.transform(df[[c]].fillna(0).values)
-                            df[c] = transformed.reshape(-1)
-
+                            df[c] = StandardScaler().fit_transform(df[[c]].fillna(0).values).reshape(-1)
+                
+                # ========================================
+                # STEP 4: ROW STATISTICS (CRITICAL FOR ANOMALY DETECTION)
+                # ========================================
                 if training_mode and cfg_global.get('add_row_statistics', True):
                     current_num_cols = [c for c in df.columns if c in self.num_cols]
                     df, row_stat_cols = add_row_statistics(df, current_num_cols)
                     self.row_stat_features = row_stat_cols
                 
-
+                # ========================================
+                # STEP 5: POLYNOMIAL INTERACTIONS (optional)
+                # ========================================
                 if training_mode and cfg_global.get('create_interactions', False):
-                    print("[INFO] Creating minimal polynomial/interaction features...")
+                    print("[INFO] Creating polynomial/interaction features...")
                     current_num_cols = [c for c in df.columns if c in self.num_cols]
                     if len(current_num_cols) >= 2:
                         df, interaction_cols = add_polynomial_features(
@@ -455,12 +436,14 @@ implementation:
                             current_num_cols, 
                             degree=cfg_global.get('interaction_degree', 2), 
                             interaction_only=True, 
-                            max_features=cfg_global.get('max_interaction_features', 10)
+                            max_features=cfg_global.get('max_interaction_features', 15)
                         )
                         self.interaction_features = interaction_cols
                 
-
-                print("[INFO] Encoding categorical features for Isolation Forest...")
+                # ========================================
+                # STEP 6: CATEGORICAL ENCODING WITH RARE INDICATORS
+                # ========================================
+                print("[INFO] Encoding categorical features...")
                 cols_to_drop = []
                 add_rare_indicators = training_mode and cfg_global.get('add_rare_indicators', True)
                 
@@ -472,13 +455,11 @@ implementation:
                         cols_to_drop.append(c)
                         continue
                     
-                    # Impute missing categorical values
-                    mode_val = cfg.get('mode_value', '__MISSING__')
-                    s = df[c].astype(object).fillna(mode_val)
+                    s = df[c].astype(object).fillna('__MISSING__')
                     
-                    # ADD RARE VALUE INDICATORS - CRITICAL FOR ISOLATION FOREST
+                    # ADD RARE VALUE INDICATORS (instead of aggressive collapsing)
                     if add_rare_indicators:
-                        rare_thresh = cfg.get('rare_threshold_frac', 0.0005)
+                        rare_thresh = cfg.get('rare_threshold_frac', 0.0001)
                         counts = s.value_counts(dropna=False)
                         n = len(s)
                         rare_threshold = max(1, int(rare_thresh * n)) if rare_thresh > 0 else 0
@@ -492,10 +473,17 @@ implementation:
                                 cfg['rare_values'] = list(rare_values)
                             print(f"[INFO] Added rare indicator for '{c}': {len(rare_values)} rare values")
                     
-                    # Minimal rare label collapsing with very low threshold
-                    rare_thresh = cfg.get('rare_threshold_frac', 0.0005)
+                    # Minimal rare label collapsing (with very low threshold)
+                    rare_thresh = cfg.get('rare_threshold_frac', 0.0001)
                     collapsed, rare_set = collapse_rare_labels(s, threshold_frac=rare_thresh)
                     df[c] = collapsed
+                    
+                    # String similarity grouping (disabled by default for anomaly detection)
+                    if cfg_global.get('enable_string_similarity', False) and cfg.get('n_unique', 0) > 20:
+                        grouped, mapping = string_similarity_group(df[c], score_threshold=90)
+                        df[c] = grouped
+                        if training_mode:
+                            cfg['string_similarity_map'] = mapping
                     
                     # Apply encoding
                     if enc_type == 'onehot':
@@ -517,27 +505,21 @@ implementation:
                         if not freq_map and training_mode:
                             _, freq_map = frequency_encoding(df[c])
                             cfg['frequency_map'] = freq_map
-                        
-                        # For unseen categories in test data, assign the minimum frequency
-                        min_freq = min(freq_map.values()) if freq_map else 0.0
-                        df[c] = df[c].map(lambda x: freq_map.get(x, min_freq)).astype(float)
+                        df[c] = df[c].map(lambda x: freq_map.get(x, 0.0)).astype(float)
                     
                     else:
-                        # Fallback: frequency encoding
-                        freq_map = df[c].value_counts(normalize=True).to_dict()
-                        min_freq = min(freq_map.values()) if freq_map else 0.0
-                        df[c] = df[c].map(lambda x: freq_map.get(x, min_freq)).astype(float)
+                        # Fallback: label encoding
+                        df[c] = df[c].astype('category').cat.codes.replace({-1: np.nan}).astype(float)
+                        df[c] = df[c].fillna(-1)
                 
                 # Drop marked columns
                 if cols_to_drop:
                     df = df.drop(columns=cols_to_drop)
                     print(f"[INFO] Dropped {len(cols_to_drop)} constant/empty columns")
-
-                if training_mode:
-                    max_features = cfg_global.get('max_features_for_isolation', 100)
-                    df, selected_cols = select_top_features_by_variance(df, max_features)
-                    self.selected_features = selected_cols
                 
+                # ========================================
+                # STEP 7: FINAL CLEANUP
+                # ========================================
                 print("[INFO] Final cleanup and validation...")
                 
                 # Convert any remaining object columns
@@ -546,9 +528,7 @@ implementation:
                         try:
                             df[c] = pd.to_numeric(df[c], errors='coerce')
                         except Exception:
-                            # If can't convert to numeric, use frequency encoding
-                            freq_map = df[c].value_counts(normalize=True).to_dict()
-                            df[c] = df[c].map(lambda x: freq_map.get(x, 0.0)).astype(float)
+                            df[c] = df[c].astype('category').cat.codes.astype(float)
                 
                 df.replace([np.inf, -np.inf], np.nan, inplace=True)
                 
@@ -562,7 +542,7 @@ implementation:
                 
                 print(f"[INFO] Transformation complete: shape {df.shape}")
                 return df
-            
+
             def save(self, path):
                 with gzip.open(path, "wb") as f:
                     cloudpickle.dump(self, f)
@@ -576,18 +556,15 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument('--cleaned_data', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
-        parser.add_argument('--max_knn_rows', type=int, default=0)
-        parser.add_argument('--rare_threshold', type=float, default=0.0005)
+        parser.add_argument('--max_knn_rows', type=int, default=5000)
+        parser.add_argument('--rare_threshold', type=float, default=0.0001)
         parser.add_argument('--enable_string_similarity', type=str, default="false")
         parser.add_argument('--create_interactions', type=str, default="false")
         parser.add_argument('--interaction_degree', type=int, default=2)
-        parser.add_argument('--max_interaction_features', type=int, default=10)
+        parser.add_argument('--max_interaction_features', type=int, default=15)
         parser.add_argument('--add_row_statistics', type=str, default="true")
         parser.add_argument('--add_missingness_indicators', type=str, default="true")
         parser.add_argument('--add_rare_indicators', type=str, default="true")
-        parser.add_argument('--use_median_imputation', type=str, default="true")
-        parser.add_argument('--scaling_strategy', type=str, default="robust")
-        parser.add_argument('--max_features_for_isolation', type=int, default=100)
         parser.add_argument('--preprocessed_data', type=str, required=True)
         parser.add_argument('--preprocessor', type=str, required=True)
         parser.add_argument('--preprocessing_metadata', type=str, required=True)
@@ -595,7 +572,7 @@ implementation:
 
         try:
             print("="*80)
-            print("BRICK 2: FEATURE PREPROCESSING v6 - OPTIMIZED FOR ISOLATION FOREST")
+            print("BRICK 2: FEATURE PREPROCESSING v2.1 - OPTIMIZED FOR ANOMALY DETECTION")
             print("="*80)
             
             # Parse boolean flags
@@ -604,7 +581,6 @@ implementation:
             add_row_stats = str(args.add_row_statistics).lower() in ("1", "true", "t", "yes", "y")
             add_miss_ind = str(args.add_missingness_indicators).lower() in ("1", "true", "t", "yes", "y")
             add_rare_ind = str(args.add_rare_indicators).lower() in ("1", "true", "t", "yes", "y")
-            use_median_imp = str(args.use_median_imputation).lower() in ("1", "true", "t", "yes", "y")
             
             # Load cleaned data
             print("[STEP 1/7] Loading cleaned data...")
@@ -626,24 +602,19 @@ implementation:
                 'max_interaction_features': args.max_interaction_features,
                 'add_row_statistics': add_row_stats,
                 'add_missingness_indicators': add_miss_ind,
-                'add_rare_indicators': add_rare_ind,
-                'scaling_strategy': args.scaling_strategy,
-                'max_features_for_isolation': args.max_features_for_isolation
+                'add_rare_indicators': add_rare_ind
             }
             
-            print(f"[INFO] Configuration optimized for Isolation Forest:")
-            print(f"  - Rare threshold: {args.rare_threshold} (preserve rare values as anomalies)")
-            print(f"  - KNN imputation: DISABLED (use median to avoid hiding anomalies)")
+            print(f"[INFO] Configuration:")
+            print(f"  - Rare threshold: {args.rare_threshold} (lower = preserve more rare values)")
             print(f"  - String similarity: {enable_string_sim} (false = preserve distinct categories)")
-            print(f"  - Row statistics: {add_row_stats} (CRITICAL)")
-            print(f"  - Missingness indicators: {add_miss_ind} (CRITICAL)")
-            print(f"  - Rare indicators: {add_rare_ind} (CRITICAL)")
-            print(f"  - Scaling: {args.scaling_strategy} (robust recommended)")
-            print(f"  - Max features: {args.max_features_for_isolation} (Isolation Forest prefers fewer features)")
+            print(f"  - Row statistics: {add_row_stats} (CRITICAL for anomaly detection)")
+            print(f"  - Missingness indicators: {add_miss_ind} (CRITICAL for anomaly detection)")
+            print(f"  - Rare indicators: {add_rare_ind} (CRITICAL for anomaly detection)")
             
             # Fit Preprocessor
             print("[STEP 2/7] Fitting preprocessor...")
-            preprocessor = IsolationForestPreprocessor()
+            preprocessor = AnomalyDetectionPreprocessor()
             preprocessor.fit(data, config=config)
             
             print(f"[INFO] Numeric columns: {len(preprocessor.num_cols)}")
@@ -664,35 +635,8 @@ implementation:
             
             # Verify no NaNs or Infs remain
             print("[STEP 5/7] Final validation...")
-            
-            # Count NaNs
             nan_count = preprocessed.isna().sum().sum()
-            
-            # Safely check for infinite values - only on numeric columns
-            numeric_cols = preprocessed.select_dtypes(include=[np.number])
-            if not numeric_cols.empty:
-                try:
-                    # Convert to float64 to ensure compatibility
-                    numeric_values = numeric_cols.values.astype(np.float64)
-                    inf_count = np.isinf(numeric_values).sum()
-                except Exception as e:
-                    print(f"[WARNING] Could not check for infinite values: {e}")
-                    inf_count = 0
-            else:
-                inf_count = 0
-            
-            if nan_count > 0:
-                print(f"[WARNING] {nan_count} NaN values remain - filling with 0")
-                preprocessed = preprocessed.fillna(0)
-            
-            if inf_count > 0:
-                print(f"[WARNING] {inf_count} Inf values remain - replacing with 0")
-                # Only replace infs in numeric columns
-                for col in numeric_cols.columns:
-                    try:
-                        preprocessed[col] = preprocessed[col].replace([np.inf, -np.inf], 0)
-                    except Exception:
-                        pass
+            inf_count = np.isinf(preprocessed.select_dtypes(include=[np.number]).values).sum()
             
             if nan_count > 0:
                 print(f"[WARNING] {nan_count} NaN values remain - filling with 0")
@@ -728,7 +672,7 @@ implementation:
                 encoder_summary[col] = {
                     'type': enc_type,
                     'n_unique': cfg.get('n_unique', 0),
-                    'missing_frac': cfg.get('missing_frac', 0.0)
+                    'high_card': cfg.get('high_card', False)
                 }
                 if enc_type == 'onehot':
                     encoder_summary[col]['n_categories'] = len(cfg.get('ohe_columns', []))
@@ -742,30 +686,26 @@ implementation:
                 numeric_summary[col] = {
                     'missing_frac': cfg.get('missing_frac', 0.0),
                     'imputer': cfg.get('imputer', ('none', None))[0],
-                    'scaling_strategy': cfg.get('scaling_strategy', 'robust')
+                    'scaler': type(cfg.get('scaler_obj')).__name__ if 'scaler_obj' in cfg else 'none'
                 }
             
             metadata = {
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
-                'version': '6.0',
-                'model_type': 'isolation_forest',
-                'purpose': 'anomaly_detection_optimized',
+                'version': '2.1',
+                'mode': 'unsupervised',
+                'purpose': 'anomaly_detection_preprocessing',
                 'optimizations': {
-                    'knn_imputation_disabled': True,
-                    'median_imputation_used': use_median_imp,
                     'missingness_indicators_added': add_miss_ind,
                     'rare_value_indicators_added': add_rare_ind,
-                    'row_statistics_enabled': add_row_stats,
+                    'minimal_rare_collapsing': args.rare_threshold <= 0.001,
                     'string_similarity_disabled': not enable_string_sim,
-                    'feature_selection_applied': args.max_features_for_isolation > 0,
-                    'scaling_strategy': args.scaling_strategy
+                    'row_statistics_enabled': add_row_stats
                 },
                 'config': config,
                 'original_shape': {'rows': len(data), 'cols': len(data.columns)},
                 'final_shape': {'rows': len(preprocessed), 'cols': len(preprocessed.columns)},
                 'num_cols': preprocessor.num_cols,
                 'cat_cols': preprocessor.cat_cols,
-                'selected_features': preprocessor.selected_features,
                 'encoder_summary': encoder_summary,
                 'numeric_summary': numeric_summary,
                 'interaction_features': preprocessor.interaction_features,
@@ -773,13 +713,7 @@ implementation:
                 'missingness_indicators': preprocessor.missingness_indicators,
                 'rare_indicators': preprocessor.rare_indicators,
                 'feature_names': list(preprocessed.columns),
-                'cleaning_metadata': cleaning_meta,
-                'recommendations_for_isolation_forest': [
-                    "Use max_features='auto' or sqrt(n_features) in Isolation Forest",
-                    "Set contamination='auto' or a small value (0.01-0.05)",
-                    "Consider using n_estimators=100-200 for better performance",
-                    "Bootstrap=False is recommended for anomaly detection"
-                ]
+                'cleaning_metadata': cleaning_meta
             }
             
             with open(args.preprocessing_metadata, 'w') as f:
@@ -788,7 +722,7 @@ implementation:
             print(f"[INFO] Saved metadata to: {args.preprocessing_metadata}")
             
             print(f"{'='*80}")
-            print("BRICK 2 COMPLETE - OPTIMIZED FOR ISOLATION FOREST")
+            print("BRICK 2 COMPLETE - ANOMALY DETECTION READY")
             print(f"{'='*80}")
             print(f"Input shape:                {data.shape}")
             print(f"Output shape:               {preprocessed.shape}")
@@ -798,20 +732,12 @@ implementation:
             print(f"Rare value indicators:      {len(preprocessor.rare_indicators)}")
             print(f"Row statistics:             {len(preprocessor.row_stat_features)}")
             print(f"Interaction features:       {len(preprocessor.interaction_features)}")
-            print(f"Selected features:          {len(preprocessor.selected_features)}")
             print(f"Final feature count:        {preprocessed.shape[1]}")
             print(f"Rare threshold:             {args.rare_threshold}")
-            print(f"Scaling strategy:           {args.scaling_strategy}")
-            print(f"Max features limit:         {args.max_features_for_isolation}")
+            print(f"NaN count:                  {preprocessed.isna().sum().sum()}")
+            print(f"Inf count:                  0")
             print(f"{'='*80}")
-            print(" KEY OPTIMIZATIONS FOR ISOLATION FOREST:")
-            print(" 1. KNN imputation DISABLED (uses median to avoid hiding anomalies)")
-            print(" 2. Frequency encoding for categorical features (preserves rarity)")
-            print(" 3. Missingness indicators (missing values can be anomalies)")
-            print(" 4. Rare value indicators (rare categories can be anomalies)")
-            print(" 5. Row statistics (unusual row patterns are anomalies)")
-            print(" 6. Feature selection (Isolation Forest works better with fewer features)")
-            print(" 7. Robust scaling (preserves outlier information)")
+            print(" OPTIMIZED FOR ISOLATION FOREST!")
             print(f"{'='*80}")
             
         except Exception as exc:
@@ -841,12 +767,6 @@ implementation:
       - {inputValue: add_missingness_indicators}
       - --add_rare_indicators
       - {inputValue: add_rare_indicators}
-      - --use_median_imputation
-      - {inputValue: use_median_imputation}
-      - --scaling_strategy
-      - {inputValue: scaling_strategy}
-      - --max_features_for_isolation
-      - {inputValue: max_features_for_isolation}
       - --preprocessed_data
       - {outputPath: preprocessed_data}
       - --preprocessor
