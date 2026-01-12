@@ -1,4 +1,4 @@
-name: Feature Preprocessing v6.1 - Optimized for Isolation Forest
+name: Feature Preprocessing v6.2 - Optimized for Isolation Forest
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
@@ -157,23 +157,25 @@ implementation:
                 print("[WARNING] No numeric columns for row statistics")
                 return df, []
             
-            num_data = df[numeric_cols].values
+            num_data = df[numeric_cols].values.astype(float)  # Ensure float type
             new_features = {}
             feature_names = []
             
             # Basic row statistics that Isolation Forest can easily split on
-            # Use safe numpy functions to handle edge cases
+            # Handle NaN values safely
             new_features['row_mean'] = np.nanmean(num_data, axis=1)
             
             # Safe standard deviation calculation
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                # Calculate variance first
+            try:
+                # Calculate variance safely
                 row_var = np.nanvar(num_data, axis=1, ddof=0)
-                # Ensure no negative variance (can happen due to floating point errors)
-                row_var = np.maximum(row_var, 0)
-                # Calculate std from variance
+                # Replace any negative or NaN values with 0
+                row_var = np.where(np.isnan(row_var) | (row_var < 0), 0, row_var)
+                # Calculate std
                 new_features['row_std'] = np.sqrt(row_var)
+            except Exception as e:
+                print(f"[WARNING] Row std calculation failed: {e}, using zeros")
+                new_features['row_std'] = np.zeros(len(df))
             
             new_features['row_min'] = np.nanmin(num_data, axis=1)
             new_features['row_max'] = np.nanmax(num_data, axis=1)
@@ -182,13 +184,16 @@ implementation:
             # Row anomalies - z-score based
             row_means = new_features['row_mean']
             row_stds = new_features['row_std']
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                # Add small epsilon to avoid division by zero
-                z_scores = np.where(row_stds > 1e-10, 
-                                   (row_means - np.nanmean(row_means)) / (np.nanstd(row_stds) + 1e-10), 
-                                   0)
-            new_features['row_z_score'] = z_scores
+            try:
+                std_of_stds = np.nanstd(row_stds)
+                if std_of_stds < 1e-10:
+                    z_scores = np.zeros_like(row_means)
+                else:
+                    z_scores = (row_means - np.nanmean(row_means)) / std_of_stds
+                new_features['row_z_score'] = np.nan_to_num(z_scores, nan=0.0)
+            except Exception as e:
+                print(f"[WARNING] Row z-score calculation failed: {e}, using zeros")
+                new_features['row_z_score'] = np.zeros(len(df))
             
             # Missing value patterns - CRITICAL for anomaly detection
             new_features['row_null_count'] = np.isnan(num_data).sum(axis=1)
@@ -196,15 +201,18 @@ implementation:
             
             # Outlier count per row
             if len(numeric_cols) > 2:
-                medians = np.nanmedian(num_data, axis=0)
-                mads = np.nanmedian(np.abs(num_data - medians), axis=0)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    # Add small epsilon to avoid division issues
-                    mads_safe = np.where(mads < 1e-10, 1e-10, mads)
-                    outlier_mask = np.abs(num_data - medians) > (3 * mads_safe + 1e-10)
-                new_features['row_outlier_count'] = np.sum(outlier_mask, axis=1)
-                new_features['row_outlier_fraction'] = new_features['row_outlier_count'] / len(numeric_cols)
+                try:
+                    medians = np.nanmedian(num_data, axis=0)
+                    mads = np.nanmedian(np.abs(num_data - medians), axis=0)
+                    # Handle zero MADs
+                    mads = np.where(mads < 1e-10, 1.0, mads)  # Replace zeros with 1.0
+                    outlier_mask = np.abs(num_data - medians) > (3 * mads)
+                    new_features['row_outlier_count'] = np.sum(outlier_mask, axis=1)
+                    new_features['row_outlier_fraction'] = new_features['row_outlier_count'] / len(numeric_cols)
+                except Exception as e:
+                    print(f"[WARNING] Outlier calculation failed: {e}, using zeros")
+                    new_features['row_outlier_count'] = np.zeros(len(df))
+                    new_features['row_outlier_fraction'] = np.zeros(len(df))
             
             feature_names = list(new_features.keys())
             
