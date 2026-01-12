@@ -1,4 +1,4 @@
-name: Feature Preprocessing v6 - Optimized for Isolation Forest
+name: Feature Preprocessing v6.1 - Optimized for Isolation Forest
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
@@ -162,8 +162,19 @@ implementation:
             feature_names = []
             
             # Basic row statistics that Isolation Forest can easily split on
+            # Use safe numpy functions to handle edge cases
             new_features['row_mean'] = np.nanmean(num_data, axis=1)
-            new_features['row_std'] = np.nanstd(num_data, axis=1, ddof=0)
+            
+            # Safe standard deviation calculation
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                # Calculate variance first
+                row_var = np.nanvar(num_data, axis=1, ddof=0)
+                # Ensure no negative variance (can happen due to floating point errors)
+                row_var = np.maximum(row_var, 0)
+                # Calculate std from variance
+                new_features['row_std'] = np.sqrt(row_var)
+            
             new_features['row_min'] = np.nanmin(num_data, axis=1)
             new_features['row_max'] = np.nanmax(num_data, axis=1)
             new_features['row_range'] = new_features['row_max'] - new_features['row_min']
@@ -173,7 +184,10 @@ implementation:
             row_stds = new_features['row_std']
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                z_scores = np.where(row_stds > 0, (row_means - np.nanmean(row_means)) / (np.nanstd(row_stds) + 1e-10), 0)
+                # Add small epsilon to avoid division by zero
+                z_scores = np.where(row_stds > 1e-10, 
+                                   (row_means - np.nanmean(row_means)) / (np.nanstd(row_stds) + 1e-10), 
+                                   0)
             new_features['row_z_score'] = z_scores
             
             # Missing value patterns - CRITICAL for anomaly detection
@@ -186,7 +200,9 @@ implementation:
                 mads = np.nanmedian(np.abs(num_data - medians), axis=0)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    outlier_mask = np.abs(num_data - medians) > (3 * mads + 1e-10)
+                    # Add small epsilon to avoid division issues
+                    mads_safe = np.where(mads < 1e-10, 1e-10, mads)
+                    outlier_mask = np.abs(num_data - medians) > (3 * mads_safe + 1e-10)
                 new_features['row_outlier_count'] = np.sum(outlier_mask, axis=1)
                 new_features['row_outlier_fraction'] = new_features['row_outlier_count'] / len(numeric_cols)
             
