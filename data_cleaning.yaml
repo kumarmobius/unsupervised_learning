@@ -1,17 +1,17 @@
-name: Data Cleaning v1.2 - Unsupervised
+name: Data Cleaning v3.0
 inputs:
   - {name: in_file, type: Dataset, description: "Path to the dataset file or directory"}
   - {name: missing_threshold, type: Float, description: "Drop columns with missing % above this", optional: true, default: "0.40"}
   - {name: unique_threshold, type: Float, description: "Drop columns with unique % above this (ID columns)", optional: true, default: "0.95"}
   - {name: numeric_detection_threshold, type: Float, description: "Fraction threshold to coerce object to numeric", optional: true, default: "0.6"}
   - {name: preview_rows, type: Integer, description: "Rows to include in preview prints", optional: true, default: "20"}
-  - {name: use_column, type: String, description: "Comma-separated list of columns to use (if empty, use all columns)", optional: true, default: ""}
-  - {name: exclude_column, type: String, description: "Comma-separated list of columns to exclude", optional: true, default: ""}
   - {name: drop_constant_columns, type: String, description: "Drop columns with only one unique value: 'true' or 'false'", optional: true, default: "true"}
   - {name: handle_missing_strategy, type: String, description: "Strategy for missing values: 'drop_rows', 'keep', 'drop_cols_only'", optional: true, default: "keep"}
+  - {name: anomaly_detection_mode, type: String, description: "Anomaly detection specific enhancements: 'basic', 'advanced', 'none'", optional: true, default: "basic"}
 outputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset parquet"}
   - {name: cleaning_metadata, type: Data, description: "JSON metadata with cleaning stats"}
+  - {name: anomaly_insights, type: Data, description: "JSON insights for anomaly detection preprocessing"}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:vtest4
@@ -24,6 +24,9 @@ implementation:
         from datetime import datetime
         import pandas as pd, numpy as np
         from pathlib import Path
+        from collections import defaultdict
+        import warnings
+        warnings.filterwarnings('ignore')
         
         # Helper functions
         def ensure_dir_for(p):
@@ -174,7 +177,6 @@ implementation:
 
             # If nothing worked, raise clearer error describing attempts
             raise ValueError(f"Unsupported or unreadable format: {path}. Last error: {last_exc}")
-
 
         def make_hashable_for_dupes(df):
             df = df.copy()
@@ -404,6 +406,272 @@ implementation:
 
             return df, report
 
+        def detect_and_handle_categorical(df, anomaly_mode='basic'):
+            report = {
+                'categorical_columns': [],
+                'high_cardinality_categorical': [],
+                'low_cardinality_categorical': [],
+                'boolean_columns': [],
+                'categorical_features_created': []
+            }
+            
+            categorical_cols = []
+            high_cardinality = []
+            low_cardinality = []
+            boolean_cols = []
+            
+            for col in df.columns:
+                # Skip if already numeric
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    continue
+                
+                # Check if it's categorical (object/string with limited unique values)
+                n_unique = df[col].nunique()
+                total = len(df[col].dropna())
+                
+                if total > 0:
+                    unique_ratio = n_unique / total
+                    
+                    # Boolean detection
+                    if n_unique <= 2:
+                        unique_vals = df[col].dropna().unique()
+                        if all(str(v).lower() in ['true', 'false', 'yes', 'no', '1', '0', 'y', 'n', 't', 'f'] for v in unique_vals):
+                            boolean_cols.append(col)
+                            report['boolean_columns'].append({'col': col, 'unique_values': n_unique})
+                            continue
+                    
+                    # Categorical detection
+                    if n_unique <= 50 or unique_ratio < 0.1:  # Either <=50 unique values or <10% unique
+                        categorical_cols.append(col)
+                        
+                        if n_unique > 20:
+                            high_cardinality.append({'col': col, 'unique_values': n_unique})
+                            report['high_cardinality_categorical'].append({'col': col, 'unique_values': n_unique})
+                        else:
+                            low_cardinality.append({'col': col, 'unique_values': n_unique})
+                            report['low_cardinality_categorical'].append({'col': col, 'unique_values': n_unique})
+            
+            print(f"[INFO] Detected {len(categorical_cols)} categorical columns")
+            print(f"[INFO] Detected {len(boolean_cols)} boolean columns")
+            
+            # For anomaly detection, we might want to create frequency features
+            if anomaly_mode == 'advanced' and categorical_cols:
+                print("[INFO] Creating frequency-based features for categorical columns...")
+                for col in categorical_cols:
+                    freq_feature_name = f"{col}_freq"
+                    value_counts = df[col].value_counts(normalize=True)
+                    df[freq_feature_name] = df[col].map(value_counts).fillna(0)
+                    report['categorical_features_created'].append({
+                        'original_col': col,
+                        'feature_name': freq_feature_name,
+                        'type': 'frequency_mapping'
+                    })
+            
+            report['categorical_columns'] = categorical_cols
+            return df, report
+
+        def analyze_distribution_for_anomaly(df, anomaly_mode='basic'):
+            report = {
+                'distribution_analysis': {},
+                'outlier_potential': {},
+                'skewed_columns': [],
+                'bimodal_columns': [],
+                'zero_inflated_columns': [],
+                'recommended_transformations': []
+            }
+            
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            for col in numeric_cols:
+                col_data = df[col].dropna()
+                if len(col_data) == 0:
+                    continue
+                
+                col_report = {
+                    'mean': float(col_data.mean()),
+                    'std': float(col_data.std()),
+                    'min': float(col_data.min()),
+                    'max': float(col_data.max()),
+                    'median': float(col_data.median()),
+                    'iqr': float(col_data.quantile(0.75) - col_data.quantile(0.25)),
+                    'skewness': float(col_data.skew()),
+                    'kurtosis': float(col_data.kurtosis()),
+                    'zero_count': int((col_data == 0).sum()),
+                    'zero_percentage': float((col_data == 0).sum() / len(col_data))
+                }
+                
+                report['distribution_analysis'][col] = col_report
+                
+                # Detect skewed distributions
+                if abs(col_report['skewness']) > 1:
+                    report['skewed_columns'].append({
+                        'col': col,
+                        'skewness': col_report['skewness'],
+                        'recommendation': 'log_transformation' if col_report['skewness'] > 0 else 'power_transformation'
+                    })
+                
+                # Detect zero-inflated columns
+                if col_report['zero_percentage'] > 0.5:
+                    report['zero_inflated_columns'].append({
+                        'col': col,
+                        'zero_percentage': col_report['zero_percentage']
+                    })
+                
+                # Calculate outlier potential (using IQR method)
+                q1 = col_data.quantile(0.25)
+                q3 = col_data.quantile(0.75)
+                iqr = q3 - q1
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+                
+                outliers = col_data[(col_data < lower_bound) | (col_data > upper_bound)]
+                outlier_percentage = len(outliers) / len(col_data)
+                
+                report['outlier_potential'][col] = {
+                    'outlier_count': int(len(outliers)),
+                    'outlier_percentage': float(outlier_percentage),
+                    'lower_bound': float(lower_bound),
+                    'upper_bound': float(upper_bound)
+                }
+                
+                if outlier_percentage > 0.05:  # More than 5% outliers
+                    report['recommended_transformations'].append({
+                        'col': col,
+                        'outlier_percentage': outlier_percentage,
+                        'transformation': 'robust_scaling'
+                    })
+            
+            return report
+
+        def calculate_temporal_features(df, anomaly_mode='basic'):
+            report = {
+                'temporal_features_created': [],
+                'seasonality_detected': []
+            }
+            
+            datetime_cols = df.select_dtypes(include=['datetime64[ns]']).columns.tolist()
+            
+            for col in datetime_cols:
+                # Already have basic features from date extraction
+                # Add additional temporal features for anomaly detection
+                if anomaly_mode == 'advanced':
+                    try:
+                        # Time since last record (for time series anomaly detection)
+                        df_sorted = df.sort_values(col)
+                        time_diffs = df_sorted[col].diff().dt.total_seconds()
+                        
+                        if not time_diffs.isna().all():
+                            df[f"{col}_time_diff"] = time_diffs
+                            df[f"{col}_time_diff_rolling_mean"] = df[f"{col}_time_diff"].rolling(window=10, min_periods=1).mean()
+                            
+                            report['temporal_features_created'].extend([
+                                f"{col}_time_diff",
+                                f"{col}_time_diff_rolling_mean"
+                            ])
+                        
+                        # Detect seasonality patterns
+                        if 'hour' in df.columns or any('hour' in c for c in df.columns):
+                            report['seasonality_detected'].append({
+                                'column': col,
+                                'seasonality': 'hourly_patterns_possible'
+                            })
+                        
+                    except Exception as e:
+                        print(f"[WARNING] Could not calculate advanced temporal features for {col}: {e}")
+            
+            return df, report
+
+        def create_anomaly_insights(df, cleaning_report, anomaly_mode='basic'):
+            insights = {
+                'dataset_characteristics': {
+                    'total_rows': len(df),
+                    'total_columns': len(df.columns),
+                    'numeric_columns': len(df.select_dtypes(include=[np.number]).columns),
+                    'categorical_columns': len(df.select_dtypes(include=['object', 'category']).columns),
+                    'datetime_columns': len(df.select_dtypes(include=['datetime64[ns]']).columns),
+                    'missing_values_total': int(df.isnull().sum().sum()),
+                    'missing_values_percentage': float(df.isnull().sum().sum() / (len(df) * len(df.columns)))
+                },
+                'data_quality_indicators': {
+                    'high_quality_features': [],
+                    'medium_quality_features': [],
+                    'low_quality_features': []
+                },
+                'anomaly_detection_recommendations': {
+                    'suitable_algorithms': [],
+                    'feature_engineering_suggestions': [],
+                    'preprocessing_steps': []
+                }
+            }
+            
+            # Analyze each column for data quality
+            for col in df.columns:
+                col_analysis = {
+                    'column': col,
+                    'dtype': str(df[col].dtype),
+                    'missing_percentage': float(df[col].isnull().sum() / len(df)),
+                    'unique_values': int(df[col].nunique()),
+                    'unique_percentage': float(df[col].nunique() / len(df))
+                }
+                
+                # Determine quality level
+                if col_analysis['missing_percentage'] < 0.05 and col_analysis['unique_percentage'] > 0.01:
+                    insights['data_quality_indicators']['high_quality_features'].append(col_analysis)
+                elif col_analysis['missing_percentage'] < 0.20:
+                    insights['data_quality_indicators']['medium_quality_features'].append(col_analysis)
+                else:
+                    insights['data_quality_indicators']['low_quality_features'].append(col_analysis)
+            
+            # Algorithm recommendations based on data characteristics
+            numeric_count = insights['dataset_characteristics']['numeric_columns']
+            categorical_count = insights['dataset_characteristics']['categorical_columns']
+            
+            if numeric_count > 5:
+                insights['anomaly_detection_recommendations']['suitable_algorithms'].extend([
+                    'IsolationForest',
+                    'LocalOutlierFactor',
+                    'OneClassSVM',
+                    'AutoEncoder (Neural Network)'
+                ])
+            
+            if categorical_count > 2:
+                insights['anomaly_detection_recommendations']['suitable_algorithms'].extend([
+                    'CBLOF (Cluster-Based)',
+                    'HBOS (Histogram-Based)'
+                ])
+            
+            if 'datetime' in str(df.dtypes).lower() or any('date' in col.lower() or 'time' in col.lower() for col in df.columns):
+                insights['anomaly_detection_recommendations']['suitable_algorithms'].extend([
+                    'TimeSeriesAnomalyDetection',
+                    'Prophet (Facebook)',
+                    'DeepAnT (LSTM-based)'
+                ])
+            
+            # Feature engineering suggestions
+            if numeric_count > 0:
+                insights['anomaly_detection_recommendations']['feature_engineering_suggestions'].extend([
+                    'StandardScaler or RobustScaler for numeric features',
+                    'Create interaction terms for highly correlated numeric features',
+                    'Consider PCA for dimensionality reduction if >20 numeric features'
+                ])
+            
+            if categorical_count > 0:
+                insights['anomaly_detection_recommendations']['feature_engineering_suggestions'].extend([
+                    'One-hot encoding for low-cardinality categorical features',
+                    'Target encoding or frequency encoding for high-cardinality categorical features',
+                    'Consider entity embeddings for categorical features with hierarchical relationships'
+                ])
+            
+            # Preprocessing steps
+            insights['anomaly_detection_recommendations']['preprocessing_steps'].extend([
+                'Handle remaining missing values (imputation or indicator)',
+                'Normalize/scale features based on algorithm requirements',
+                'Consider feature selection to remove redundant features',
+                'Create time-based features if temporal patterns exist'
+            ])
+            
+            return insights
+
         # Main execution
         parser=argparse.ArgumentParser()
         parser.add_argument('--in_file', type=str, required=True)
@@ -411,24 +679,24 @@ implementation:
         parser.add_argument('--unique_threshold', type=float, default=0.95)
         parser.add_argument('--numeric_detection_threshold', type=float, default=0.6)
         parser.add_argument('--preview_rows', type=int, default=20)
-        parser.add_argument('--use_column', type=str, default='')
-        parser.add_argument('--exclude_column', type=str, default='')
         parser.add_argument('--drop_constant_columns', type=str, default='true')
         parser.add_argument('--handle_missing_strategy', type=str, default='keep')
+        parser.add_argument('--anomaly_detection_mode', type=str, default='basic')
         parser.add_argument('--cleaned_data', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
+        parser.add_argument('--anomaly_insights', type=str, required=True)
         args=parser.parse_args()
 
         try:
             print("="*80)
-            print("BRICK 1: DATA CLEANING v2.0 - UNSUPERVISED LEARNING")
+            print("DATA CLEANING v2.0 - ANOMALY DETECTION PREPROCESSING")
             print("="*80)
             
             # Parse boolean
             drop_const = args.drop_constant_columns.lower() in ('true', '1', 'yes')
             
             # Load data
-            print("[STEP 1/11] Loading data...")
+            print("[STEP 1/13] Loading data...")
             df = read_with_pandas(args.in_file)
             print(f"[INFO] Shape: {df.shape}")
             print(f"[INFO] Columns: {list(df.columns)}")
@@ -437,53 +705,23 @@ implementation:
                 print("[ERROR] Empty dataset", file=sys.stderr)
                 sys.exit(1)
             
-            # Remove duplicates
-            print("[STEP 2/11] Removing duplicates...")
+            all_columns_before_filter = list(df.columns)
             before_rows = len(df)
+            
+            # Remove duplicates
+            print("[STEP 2/13] Removing duplicates...")
             df = make_hashable_for_dupes(df).drop_duplicates(keep='first')
             dropped_dupes = before_rows - len(df)
             print(f"[INFO] Removed {dropped_dupes} duplicate rows")
             
-            # Apply column filters
-            print("[STEP 3/11] Applying column filters...")
-            all_columns_before_filter = list(df.columns)
-            kept_user_cols = []
-            missing_user_cols = []
-            excluded_cols = []
-            
-            # Handle exclusions first
-            if args.exclude_column and args.exclude_column.strip():
-                to_exclude = [c.strip() for c in args.exclude_column.split(',') if c.strip()]
-                excluded_cols = [c for c in to_exclude if c in df.columns]
-                missing_excluded = [c for c in to_exclude if c not in df.columns]
-                
-                if excluded_cols:
-                    df = df.drop(columns=excluded_cols)
-                    print(f"[INFO] Excluded {len(excluded_cols)} columns: {excluded_cols}")
-                if missing_excluded:
-                    print(f"[WARNING] Columns to exclude not found: {missing_excluded}")
-            
-            # Handle inclusions
-            if args.use_column and args.use_column.strip():
-                to_use = [c.strip() for c in args.use_column.split(',') if c.strip()]
-                kept_user_cols = [c for c in to_use if c in df.columns]
-                missing_user_cols = [c for c in to_use if c not in df.columns]
-                
-                if kept_user_cols:
-                    df = df[kept_user_cols]
-                    print(f"[INFO] Kept {len(kept_user_cols)} user-specified columns")
-                    if missing_user_cols:
-                        print(f"[WARNING] Columns not found: {missing_user_cols}")
-                else:
-                    print(f"[ERROR] None of the specified columns found in dataset", file=sys.stderr)
-                    sys.exit(1)
-            else:
-                print("[INFO] No column filtering - using all remaining columns")
+            # Detect and handle categorical columns for anomaly detection
+            print("[STEP 3/13] Detecting categorical columns...")
+            df, categorical_report = detect_and_handle_categorical(df, args.anomaly_detection_mode)
             
             # Drop constant columns (if enabled)
             cols_to_drop_constant = []
             if drop_const:
-                print(f"[STEP 4/11] Dropping constant columns...")
+                print(f"[STEP 4/13] Dropping constant columns...")
                 for col in df.columns:
                     if df[col].nunique(dropna=False) <= 1:
                         cols_to_drop_constant.append(col)
@@ -493,10 +731,10 @@ implementation:
                 else:
                     print("[INFO] No constant columns found")
             else:
-                print(f"[STEP 4/11] Skipping constant column removal (disabled)")
+                print(f"[STEP 4/13] Skipping constant column removal (disabled)")
             
             # Drop high-missing columns
-            print(f"[STEP 5/11] Dropping columns >{args.missing_threshold*100}% missing...")
+            print(f"[STEP 5/13] Dropping columns >{args.missing_threshold*100}% missing...")
             missing_report = {}
             cols_to_drop_missing = []
             for col in df.columns:
@@ -510,8 +748,8 @@ implementation:
             else:
                 print("[INFO] No high-missing columns to drop")
             
-            # Drop ID columns
-            print(f"[STEP 6/11] Dropping ID columns >{args.unique_threshold*100}% unique...")
+            # Drop ID columns (with special consideration for anomaly detection)
+            print(f"[STEP 6/13] Dropping ID columns >{args.unique_threshold*100}% unique...")
             unique_report = {}
             cols_to_drop_unique = []
             for col in df.columns:
@@ -520,9 +758,16 @@ implementation:
                 if unique_pct > args.unique_threshold:
                     is_numeric = pd.api.types.is_numeric_dtype(df[col])
                     is_float = pd.api.types.is_float_dtype(df[col])
+                    # For anomaly detection, be more conservative about dropping columns
                     if is_numeric and is_float and len(df[col].dropna()) > 0:
                         std = df[col].std()
                         if std > 0: continue
+                    # Keep columns that might be useful for anomaly detection context
+                    col_lower = col.lower()
+                    if any(keyword in col_lower for keyword in ['id', 'key', 'code', 'ref', 'num']):
+                        if args.anomaly_detection_mode == 'advanced':
+                            print(f"[INFO] Keeping potential ID column for context: {col}")
+                            continue
                     cols_to_drop_unique.append(col)
             if cols_to_drop_unique:
                 print(f"[INFO] Dropping {len(cols_to_drop_unique)} ID columns")
@@ -531,28 +776,36 @@ implementation:
                 print("[INFO] No ID columns to drop")
             
             # Convert object to numeric
-            print(f"[STEP 7/11] Converting object→numeric...")
+            print(f"[STEP 7/13] Converting object→numeric...")
             df, conv_report = convert_object_columns_advanced(
                 df, detect_threshold=args.numeric_detection_threshold, exclude_cols=set()
             )
             print(f"[INFO] Converted {len(conv_report['converted'])} columns")
             
             # Extract dates with deduplication
-            print(f"[STEP 8/11] Extracting date features (with deduplication)...")
+            print(f"[STEP 8/13] Extracting date features (with deduplication)...")
             df, date_report = detect_and_deduplicate_dates(df, exclude_cols=set())
             print(f"[INFO] Detected {len(date_report['date_columns'])} unique date columns")
             if date_report['duplicate_dates_dropped']:
                 print(f"[INFO] Removed {sum(len(d['dropped']) for d in date_report['duplicate_dates_dropped'])} duplicate date columns")
             
+            # Calculate temporal features for anomaly detection
+            print(f"[STEP 9/13] Calculating temporal features...")
+            df, temporal_report = calculate_temporal_features(df, args.anomaly_detection_mode)
+            
+            # Analyze distributions for anomaly detection insights
+            print(f"[STEP 10/13] Analyzing distributions for anomaly detection...")
+            distribution_report = analyze_distribution_for_anomaly(df, args.anomaly_detection_mode)
+            
             # Drop _orig columns
-            print(f"[STEP 9/11] Cleaning up temporary columns...")
+            print(f"[STEP 11/13] Cleaning up temporary columns...")
             cols_orig = [c for c in df.columns if c.endswith('_orig')]
             if cols_orig:
                 df = df.drop(columns=cols_orig)
                 print(f"[INFO] Dropped {len(cols_orig)} _orig columns")
             
             # Handle missing values based on strategy
-            print(f"[STEP 10/11] Handling missing values (strategy: {args.handle_missing_strategy})...")
+            print(f"[STEP 12/13] Handling missing values (strategy: {args.handle_missing_strategy})...")
             rows_before_missing = len(df)
             
             if args.handle_missing_strategy == 'drop_rows':
@@ -573,10 +826,27 @@ implementation:
                 print("[ERROR] No columns remaining after cleaning", file=sys.stderr)
                 sys.exit(1)
             
+            # Create anomaly detection insights
+            print(f"[STEP 13/13] Creating anomaly detection insights...")
+            cleaning_report = {
+                'dropped_duplicates': dropped_dupes,
+                'dropped_constant_cols': cols_to_drop_constant,
+                'dropped_missing_cols': cols_to_drop_missing,
+                'dropped_unique_cols': cols_to_drop_unique,
+                'dropped_rows_missing': rows_before_missing - len(df),
+                'categorical_report': categorical_report,
+                'date_report': date_report,
+                'temporal_report': temporal_report,
+                'distribution_report': distribution_report
+            }
+            
+            anomaly_insights = create_anomaly_insights(df, cleaning_report, args.anomaly_detection_mode)
+            
             # Save outputs
-            print(f"[STEP 11/11] Saving outputs...")
+            print(f"[SAVING] Saving outputs...")
             ensure_dir_for(args.cleaned_data)
             ensure_dir_for(args.cleaning_metadata)
+            ensure_dir_for(args.anomaly_insights)
             
             df.to_parquet(args.cleaned_data, index=False)
             
@@ -592,7 +862,7 @@ implementation:
             metadata = {
                 'timestamp': datetime.utcnow().isoformat()+'Z',
                 'version': '2.0',
-                'mode': 'unsupervised',
+                'mode': 'anomaly_detection_preprocessing',
                 'original_shape': {'rows': before_rows, 'cols': len(all_columns_before_filter)},
                 'final_shape': {'rows': len(df), 'cols': len(df.columns)},
                 'dropped_duplicates': dropped_dupes,
@@ -600,17 +870,17 @@ implementation:
                 'dropped_missing_cols': cols_to_drop_missing,
                 'dropped_unique_cols': cols_to_drop_unique,
                 'dropped_rows_missing': rows_before_missing - len(df),
-                'user_specified_columns': kept_user_cols if kept_user_cols else 'all',
-                'excluded_columns': excluded_cols,
-                'missing_user_columns': missing_user_cols,
                 'all_columns_before_filter': all_columns_before_filter,
                 'missing_report': missing_report,
                 'unique_report': unique_report,
                 'conversion_report': conv_report,
                 'date_report': date_report,
+                'categorical_report': categorical_report,
+                'temporal_report': temporal_report,
                 'column_names': list(df.columns),
                 'dtypes_summary': dtypes_summary,
                 'missing_strategy': args.handle_missing_strategy,
+                'anomaly_detection_mode': args.anomaly_detection_mode,
                 'settings': {
                     'missing_threshold': args.missing_threshold,
                     'unique_threshold': args.unique_threshold,
@@ -622,13 +892,24 @@ implementation:
             with open(args.cleaning_metadata, 'w') as f:
                 json.dump(metadata, f, indent=2)
             
+            with open(args.anomaly_insights, 'w') as f:
+                json.dump(anomaly_insights, f, indent=2)
+            
             print(f"{'='*80}")
-            print("BRICK 1 COMPLETE")
+            print("ANOMALY DETECTION PREPROCESSING COMPLETE")
             print(f"{'='*80}")
             print(f"Final data shape: {df.shape}")
             print(f"Columns: {list(df.columns)[:10]}{'...' if len(df.columns) > 10 else ''}")
             print(f"Data types: {df.dtypes.value_counts().to_dict()}")
-            print(f"Saved to: {args.cleaned_data}")
+            print(f"Saved cleaned data to: {args.cleaned_data}")
+            print(f"Saved cleaning metadata to: {args.cleaning_metadata}")
+            print(f"Saved anomaly insights to: {args.anomaly_insights}")
+            print(f"{'='*80}")
+            print("ANOMALY DETECTION INSIGHTS SUMMARY:")
+            print(f"  - High quality features: {len(anomaly_insights['data_quality_indicators']['high_quality_features'])}")
+            print(f"  - Recommended algorithms: {', '.join(anomaly_insights['anomaly_detection_recommendations']['suitable_algorithms'][:3])}")
+            print(f"  - Skewed columns detected: {len(distribution_report['skewed_columns'])}")
+            print(f"  - Columns with outlier potential: {sum(1 for v in distribution_report['outlier_potential'].values() if v['outlier_percentage'] > 0.05)}")
             
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -645,15 +926,15 @@ implementation:
       - {inputValue: numeric_detection_threshold}
       - --preview_rows
       - {inputValue: preview_rows}
-      - --use_column
-      - {inputValue: use_column}
-      - --exclude_column
-      - {inputValue: exclude_column}
       - --drop_constant_columns
       - {inputValue: drop_constant_columns}
       - --handle_missing_strategy
       - {inputValue: handle_missing_strategy}
+      - --anomaly_detection_mode
+      - {inputValue: anomaly_detection_mode}
       - --cleaned_data
       - {outputPath: cleaned_data}
       - --cleaning_metadata
       - {outputPath: cleaning_metadata}
+      - --anomaly_insights
+      - {outputPath: anomaly_insights}
