@@ -1,4 +1,4 @@
-name: Feature Preprocessing v4.1 - Anomaly Detection
+name: Feature Preprocessing v4.2 - Anomaly Detection
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from unsupervised cleaning"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning step"}
@@ -71,35 +71,48 @@ implementation:
             if v.empty or v.std(ddof=0) == 0:
                 return RobustScaler()
             
-            skew = abs(float(v.skew()))
-            kurt = abs(float(v.kurtosis())) if len(v) > 3 else 0.0
-            extreme_frac = float(((v - v.mean()).abs() > 3 * v.std(ddof=0)).mean())
-            
-            # For anomaly detection: prefer robust scaling for outliers/heavy tails
-            if extreme_frac > 0.01 or kurt > 10:
+            # For anomaly detection: use quantile-based scaling to PRESERVE outliers
+            q1, q3 = v.quantile([0.25, 0.75])
+            iqr = q3 - q1
+            if iqr == 0:
                 return RobustScaler()
-            # Use PowerTransformer for skewed distributions
-            elif skew >= 1.0:
-                return Pipeline([('power', PowerTransformer(method='yeo-johnson')), ('std', RobustScaler())])
+            
+            # Check outlier percentage
+            outlier_frac = ((v < q1 - 1.5*iqr) | (v > q3 + 1.5*iqr)).mean()
+            
+            # More outliers = wider quantile range to preserve them
+            if outlier_frac > 0.05:
+                return RobustScaler(quantile_range=(10, 90))  # Very wide - preserves outliers
+            elif outlier_frac > 0.02:
+                return RobustScaler(quantile_range=(15, 85))  # Wide range
             else:
-                return RobustScaler()  # Default for anomaly detection
+                return RobustScaler(quantile_range=(25, 75))  # Standard range
 
         def choose_categorical_encoder(col, series, n_rows):
             nunique = series.nunique(dropna=True)
-            
             if nunique == 0:
                 return 'drop', None
             elif nunique == 1:
                 return 'drop', None
             elif nunique == 2:
-                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-            elif nunique <= 10:
-                return 'onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+                return 'onehot', OneHotEncoder(
+                    sparse_output=False, 
+                    handle_unknown='infrequent_if_exist',
+                    min_frequency=0.01
+                )
+            elif nunique <= 15:
+                return 'onehot', OneHotEncoder(
+                    sparse_output=False, 
+                    handle_unknown='infrequent_if_exist',
+                    min_frequency=0.01
+                )
             elif nunique <= 50:
                 return 'frequency', None
             else:
-                # High cardinality - use frequency encoding
-                return 'frequency', None
+                if nunique > 0.9 * n_rows:
+                    return 'frequency_high_card', None
+                else:
+                    return 'frequency', None
 
         def add_polynomial_features(df, numeric_cols, degree=2, interaction_only=True, max_features=20):
             if len(numeric_cols) < 2:
